@@ -1,5 +1,8 @@
 #include "RenderTrailProtocol.h"
 #include "IRenderTrailAnalyzerEditorModule.h"
+#include "RenderTrailAnalyzerEvidence.h"
+#include "RenderTrailAnalyzerImageView.h"
+#include "RenderTrailAnalyzerPrompt.h"
 #include "RenderTrailModelBrokerSettings.h"
 
 #include "Brushes/SlateColorBrush.h"
@@ -50,552 +53,6 @@ DEFINE_LOG_CATEGORY_STATIC(LogRenderTrailAnalyzer, Log, All);
 
 namespace UE::RenderTrail::Private
 {
-	DECLARE_DELEGATE_TwoParams(FOnPixelPicked, int32, int32);
-
-	struct FPixelMarker
-	{
-		FIntPoint Pixel = FIntPoint::ZeroValue;
-	};
-
-	class SRenderTrailImageView final : public SLeafWidget
-	{
-	public:
-		SLATE_BEGIN_ARGS(SRenderTrailImageView) {}
-			SLATE_EVENT(FOnPixelPicked, OnPixelPicked)
-		SLATE_END_ARGS()
-
-		void Construct(const FArguments& Args)
-		{
-			OnPixelPicked = Args._OnPixelPicked;
-			SetCanTick(false);
-		}
-
-		void SetImage(const TSharedPtr<FSlateDynamicImageBrush>& InBrush, FIntPoint InSize, TArray<uint8> InPixelBytes = {})
-		{
-			Brush = InBrush;
-			ImageSize = InSize;
-			PixelBytes = MoveTemp(InPixelBytes);
-			Zoom = 1.0f;
-			Pan = FVector2f::ZeroVector;
-			Markers.Empty();
-			HoveredPixel = FIntPoint::ZeroValue;
-			bHasHoveredPixel = false;
-			Invalidate(EInvalidateWidgetReason::Paint | EInvalidateWidgetReason::Layout);
-		}
-
-		void SetMarkers(const TArray<FPixelMarker>& InMarkers)
-		{
-			Markers = InMarkers;
-			Invalidate(EInvalidateWidgetReason::Paint);
-		}
-
-		virtual FVector2D ComputeDesiredSize(float) const override
-		{
-			return FVector2D(800.0f, 520.0f);
-		}
-
-		virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
-			FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override
-		{
-			OutDrawElements.PushClip(FSlateClippingZone(AllottedGeometry));
-			const FVector2f LocalSize = AllottedGeometry.GetLocalSize();
-			const FSlateBrush* Background = FCoreStyle::Get().GetBrush(TEXT("WhiteBrush"));
-			FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
-				AllottedGeometry.ToPaintGeometry(LocalSize, FSlateLayoutTransform()), Background,
-				ESlateDrawEffect::None, FLinearColor(0.015f, 0.018f, 0.022f, 1.0f));
-
-			FVector2f Origin;
-			FVector2f DrawSize;
-			float Scale = 0.0f;
-			if (Brush.IsValid() && ComputeImageRect(LocalSize, Origin, DrawSize, Scale))
-			{
-				if (Scale >= PixelExactMinScale && HasPixelBytes())
-				{
-					DrawPixelExact(OutDrawElements, AllottedGeometry, LayerId + 1, LocalSize, Origin, Scale);
-				}
-				else
-				{
-					FSlateDrawElement::MakeBox(OutDrawElements, LayerId + 1,
-						AllottedGeometry.ToPaintGeometry(DrawSize, FSlateLayoutTransform(Origin)), Brush.Get(),
-						ESlateDrawEffect::None, InWidgetStyle.GetColorAndOpacityTint());
-				}
-
-				if (Scale >= PixelGridMinScale)
-				{
-					DrawPixelGrid(OutDrawElements, AllottedGeometry, LayerId + 2, LocalSize, Origin, Scale);
-					if (bHasHoveredPixel)
-					{
-						DrawPixelOutline(OutDrawElements, AllottedGeometry, LayerId + 3, Origin, Scale,
-							HoveredPixel, FLinearColor(1.0f, 0.85f, 0.1f, 1.0f), 1.5f);
-					}
-				}
-
-				for (const FPixelMarker& Marker : Markers)
-				{
-					const FLinearColor Color = GetMarkerColor();
-					if (Scale >= PixelGridMinScale)
-					{
-						DrawPixelOutline(OutDrawElements, AllottedGeometry, LayerId + 4, Origin, Scale,
-							Marker.Pixel, Color, 2.5f);
-						continue;
-					}
-
-					const FVector2f PixelCenter = Origin + FVector2f((Marker.Pixel.X + 0.5f) * Scale, (Marker.Pixel.Y + 0.5f) * Scale);
-					const float Arm = 10.0f;
-					TArray<FVector2f> Horizontal = {PixelCenter - FVector2f(Arm, 0), PixelCenter + FVector2f(Arm, 0)};
-					TArray<FVector2f> Vertical = {PixelCenter - FVector2f(0, Arm), PixelCenter + FVector2f(0, Arm)};
-					FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 4, AllottedGeometry.ToPaintGeometry(), Horizontal,
-						ESlateDrawEffect::None, Color, true, 2.0f);
-					FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 4, AllottedGeometry.ToPaintGeometry(), Vertical,
-						ESlateDrawEffect::None, Color, true, 2.0f);
-				}
-			}
-			OutDrawElements.PopClip();
-			return LayerId + 4;
-		}
-
-		virtual FReply OnMouseButtonDown(const FGeometry& Geometry, const FPointerEvent& Event) override
-		{
-			if (Event.GetEffectingButton() == EKeys::LeftMouseButton)
-			{
-				const FVector2f Local = Geometry.AbsoluteToLocal(Event.GetScreenSpacePosition());
-				FIntPoint Pixel;
-				if (TryGetPixelAtLocal(Local, Geometry.GetLocalSize(), Pixel))
-				{
-					OnPixelPicked.ExecuteIfBound(Pixel.X, Pixel.Y);
-				}
-				return FReply::Handled();
-			}
-			if (Event.GetEffectingButton() == EKeys::MiddleMouseButton || Event.GetEffectingButton() == EKeys::RightMouseButton)
-			{
-				bPanning = true;
-				LastPanPoint = Geometry.AbsoluteToLocal(Event.GetScreenSpacePosition());
-				return FReply::Handled().CaptureMouse(SharedThis(this));
-			}
-			return FReply::Unhandled();
-		}
-
-		virtual FReply OnMouseMove(const FGeometry& Geometry, const FPointerEvent& Event) override
-		{
-			const FVector2f Current = Geometry.AbsoluteToLocal(Event.GetScreenSpacePosition());
-			if (bPanning && HasMouseCapture())
-			{
-				Pan += Current - LastPanPoint;
-				ClampPan(Geometry.GetLocalSize());
-				LastPanPoint = Current;
-				UpdateHoveredPixel(Current, Geometry.GetLocalSize());
-				Invalidate(EInvalidateWidgetReason::Paint);
-				return FReply::Handled();
-			}
-			if (UpdateHoveredPixel(Current, Geometry.GetLocalSize()))
-			{
-				Invalidate(EInvalidateWidgetReason::Paint);
-			}
-			return FReply::Unhandled();
-		}
-
-		virtual FReply OnMouseButtonUp(const FGeometry& Geometry, const FPointerEvent& Event) override
-		{
-			if (bPanning && (Event.GetEffectingButton() == EKeys::MiddleMouseButton || Event.GetEffectingButton() == EKeys::RightMouseButton))
-			{
-				bPanning = false;
-				UpdateHoveredPixel(Geometry.AbsoluteToLocal(Event.GetScreenSpacePosition()), Geometry.GetLocalSize());
-				Invalidate(EInvalidateWidgetReason::Paint);
-				return FReply::Handled().ReleaseMouseCapture();
-			}
-			return FReply::Unhandled();
-		}
-
-		virtual FReply OnMouseWheel(const FGeometry& Geometry, const FPointerEvent& Event) override
-		{
-			const FVector2f LocalSize = Geometry.GetLocalSize();
-			const FVector2f Cursor = Geometry.AbsoluteToLocal(Event.GetScreenSpacePosition());
-			FVector2f OldOrigin;
-			FVector2f OldDrawSize;
-			float OldScale = 0.0f;
-			const bool bHadImageRect = ComputeImageRect(LocalSize, OldOrigin, OldDrawSize, OldScale);
-			const FVector2f ImagePoint = bHadImageRect ? (Cursor - OldOrigin) / OldScale : FVector2f::ZeroVector;
-
-			Zoom = FMath::Clamp(Zoom * FMath::Pow(1.2f, Event.GetWheelDelta()), 0.1f, 128.0f);
-			if (bHadImageRect)
-			{
-				const float FitScale = FMath::Min(LocalSize.X / ImageSize.X, LocalSize.Y / ImageSize.Y);
-				const float NewScale = FitScale * Zoom;
-				const FVector2f NewDrawSize = FVector2f(ImageSize) * NewScale;
-				Pan = Cursor - ImagePoint * NewScale - (LocalSize - NewDrawSize) * 0.5f;
-			}
-			ClampPan(LocalSize);
-			UpdateHoveredPixel(Cursor, LocalSize);
-			Invalidate(EInvalidateWidgetReason::Paint);
-			return FReply::Handled();
-		}
-
-		virtual void OnMouseLeave(const FPointerEvent& Event) override
-		{
-			SLeafWidget::OnMouseLeave(Event);
-			if (!bPanning && bHasHoveredPixel)
-			{
-				bHasHoveredPixel = false;
-				Invalidate(EInvalidateWidgetReason::Paint);
-			}
-		}
-
-	private:
-		static constexpr float PixelExactMinScale = 4.0f;
-		static constexpr float PixelGridMinScale = 8.0f;
-
-		static FLinearColor GetMarkerColor()
-		{
-			return FLinearColor(0.0f, 0.0f, 0.0f, 1.0f);
-		}
-
-		bool HasPixelBytes() const
-		{
-			return ImageSize.X > 0 && ImageSize.Y > 0
-				&& PixelBytes.Num() == static_cast<int64>(ImageSize.X) * ImageSize.Y * 4;
-		}
-
-		bool ComputeVisiblePixelRange(FVector2f LocalSize, FVector2f Origin, float Scale,
-			int32& OutFirstX, int32& OutFirstY, int32& OutEndX, int32& OutEndY) const
-		{
-			if (Scale <= 0.0f)
-			{
-				return false;
-			}
-			OutFirstX = FMath::Clamp(FMath::FloorToInt(-Origin.X / Scale), 0, ImageSize.X);
-			OutFirstY = FMath::Clamp(FMath::FloorToInt(-Origin.Y / Scale), 0, ImageSize.Y);
-			OutEndX = FMath::Clamp(FMath::CeilToInt((LocalSize.X - Origin.X) / Scale), 0, ImageSize.X);
-			OutEndY = FMath::Clamp(FMath::CeilToInt((LocalSize.Y - Origin.Y) / Scale), 0, ImageSize.Y);
-			return OutFirstX < OutEndX && OutFirstY < OutEndY;
-		}
-
-		void DrawPixelExact(FSlateWindowElementList& OutDrawElements, const FGeometry& Geometry, int32 Layer,
-			FVector2f LocalSize, FVector2f Origin, float Scale) const
-		{
-			int32 FirstX = 0;
-			int32 FirstY = 0;
-			int32 EndX = 0;
-			int32 EndY = 0;
-			if (!ComputeVisiblePixelRange(LocalSize, Origin, Scale, FirstX, FirstY, EndX, EndY))
-			{
-				return;
-			}
-
-			const FSlateBrush* WhiteBrush = FCoreStyle::Get().GetBrush(TEXT("WhiteBrush"));
-			const FSlateResourceHandle ResourceHandle = WhiteBrush->GetRenderingResource();
-			const FSlateShaderResourceProxy* ResourceProxy = ResourceHandle.GetResourceProxy();
-			const FVector2f WhiteUv = ResourceProxy
-				? ResourceProxy->StartUV + ResourceProxy->SizeUV * 0.5f
-				: FVector2f(0.5f, 0.5f);
-			const FSlateRenderTransform& RenderTransform = Geometry.GetAccumulatedRenderTransform();
-
-			TArray<FSlateVertex> Vertices;
-			TArray<SlateIndex> Indices;
-			constexpr int32 MaxPixelsPerBatch = 12000;
-			Vertices.Reserve(MaxPixelsPerBatch * 4);
-			Indices.Reserve(MaxPixelsPerBatch * 6);
-
-			auto FlushBatch = [&]()
-			{
-				if (!Vertices.IsEmpty())
-				{
-					FSlateDrawElement::MakeCustomVerts(OutDrawElements, Layer, ResourceHandle, Vertices, Indices,
-						nullptr, 0, 0, ESlateDrawEffect::None);
-					Vertices.Reset();
-					Indices.Reset();
-				}
-			};
-
-			int32 PixelsInBatch = 0;
-			for (int32 Y = FirstY; Y < EndY; ++Y)
-			{
-				for (int32 X = FirstX; X < EndX; ++X)
-				{
-					if (PixelsInBatch == MaxPixelsPerBatch)
-					{
-						FlushBatch();
-						PixelsInBatch = 0;
-					}
-
-					const int64 ByteOffset = (static_cast<int64>(Y) * ImageSize.X + X) * 4;
-					const FColor PixelColor(
-						PixelBytes[ByteOffset + 2], PixelBytes[ByteOffset + 1], PixelBytes[ByteOffset], PixelBytes[ByteOffset + 3]);
-					const FVector2f TopLeft = Origin + FVector2f(X * Scale, Y * Scale);
-					const FVector2f BottomRight = TopLeft + FVector2f(Scale, Scale);
-					const SlateIndex BaseIndex = static_cast<SlateIndex>(Vertices.Num());
-					Vertices.Add(FSlateVertex::Make<ESlateVertexRounding::Disabled>(RenderTransform,
-						TopLeft, WhiteUv, PixelColor));
-					Vertices.Add(FSlateVertex::Make<ESlateVertexRounding::Disabled>(RenderTransform,
-						FVector2f(BottomRight.X, TopLeft.Y), WhiteUv, PixelColor));
-					Vertices.Add(FSlateVertex::Make<ESlateVertexRounding::Disabled>(RenderTransform,
-						BottomRight, WhiteUv, PixelColor));
-					Vertices.Add(FSlateVertex::Make<ESlateVertexRounding::Disabled>(RenderTransform,
-						FVector2f(TopLeft.X, BottomRight.Y), WhiteUv, PixelColor));
-					Indices.Add(BaseIndex);
-					Indices.Add(BaseIndex + 1);
-					Indices.Add(BaseIndex + 2);
-					Indices.Add(BaseIndex);
-					Indices.Add(BaseIndex + 2);
-					Indices.Add(BaseIndex + 3);
-					++PixelsInBatch;
-				}
-			}
-			FlushBatch();
-		}
-
-		void DrawPixelGrid(FSlateWindowElementList& OutDrawElements, const FGeometry& Geometry, int32 Layer,
-			FVector2f LocalSize, FVector2f Origin, float Scale) const
-		{
-			int32 FirstX = 0;
-			int32 FirstY = 0;
-			int32 EndX = 0;
-			int32 EndY = 0;
-			if (!ComputeVisiblePixelRange(LocalSize, Origin, Scale, FirstX, FirstY, EndX, EndY))
-			{
-				return;
-			}
-
-			const FLinearColor GridColor(0.0f, 0.0f, 0.0f, 0.55f);
-			const float MinY = Origin.Y + FirstY * Scale;
-			const float MaxY = Origin.Y + EndY * Scale;
-			for (int32 X = FirstX; X <= EndX; ++X)
-			{
-				const float LineX = Origin.X + X * Scale;
-				const TArray<FVector2f> Line = {FVector2f(LineX, MinY), FVector2f(LineX, MaxY)};
-				FSlateDrawElement::MakeLines(OutDrawElements, Layer, Geometry.ToPaintGeometry(), Line,
-					ESlateDrawEffect::None, GridColor, false, 1.0f);
-			}
-			const float MinX = Origin.X + FirstX * Scale;
-			const float MaxX = Origin.X + EndX * Scale;
-			for (int32 Y = FirstY; Y <= EndY; ++Y)
-			{
-				const float LineY = Origin.Y + Y * Scale;
-				const TArray<FVector2f> Line = {FVector2f(MinX, LineY), FVector2f(MaxX, LineY)};
-				FSlateDrawElement::MakeLines(OutDrawElements, Layer, Geometry.ToPaintGeometry(), Line,
-					ESlateDrawEffect::None, GridColor, false, 1.0f);
-			}
-		}
-
-		static void DrawPixelOutline(FSlateWindowElementList& OutDrawElements, const FGeometry& Geometry, int32 Layer,
-			FVector2f Origin, float Scale, FIntPoint Pixel, const FLinearColor& Color, float Thickness)
-		{
-			const float Inset = FMath::Min(Thickness * 0.5f, Scale * 0.2f);
-			const FVector2f TopLeft = Origin + FVector2f(Pixel) * Scale + FVector2f(Inset);
-			const FVector2f BottomRight = Origin + FVector2f(Pixel + FIntPoint(1, 1)) * Scale - FVector2f(Inset);
-			const TArray<FVector2f> Outline = {
-				TopLeft,
-				FVector2f(BottomRight.X, TopLeft.Y),
-				BottomRight,
-				FVector2f(TopLeft.X, BottomRight.Y),
-				TopLeft};
-			FSlateDrawElement::MakeLines(OutDrawElements, Layer, Geometry.ToPaintGeometry(), Outline,
-				ESlateDrawEffect::None, Color, false, Thickness);
-		}
-
-		bool TryGetPixelAtLocal(FVector2f Local, FVector2f LocalSize, FIntPoint& OutPixel) const
-		{
-			FVector2f Origin;
-			FVector2f DrawSize;
-			float Scale = 0.0f;
-			if (!ComputeImageRect(LocalSize, Origin, DrawSize, Scale))
-			{
-				return false;
-			}
-			const FVector2f ImagePoint = (Local - Origin) / Scale;
-			OutPixel = FIntPoint(FMath::FloorToInt(ImagePoint.X), FMath::FloorToInt(ImagePoint.Y));
-			return OutPixel.X >= 0 && OutPixel.Y >= 0 && OutPixel.X < ImageSize.X && OutPixel.Y < ImageSize.Y;
-		}
-
-		bool UpdateHoveredPixel(FVector2f Local, FVector2f LocalSize)
-		{
-			FIntPoint NewPixel;
-			const bool bNewHasHoveredPixel = TryGetPixelAtLocal(Local, LocalSize, NewPixel);
-			const bool bChanged = bNewHasHoveredPixel != bHasHoveredPixel
-				|| (bNewHasHoveredPixel && NewPixel != HoveredPixel);
-			bHasHoveredPixel = bNewHasHoveredPixel;
-			if (bNewHasHoveredPixel)
-			{
-				HoveredPixel = NewPixel;
-			}
-			return bChanged;
-		}
-
-		static FVector2f ConstrainPan(FVector2f LocalSize, FVector2f DrawSize, FVector2f RequestedPan)
-		{
-			FVector2f Result = RequestedPan;
-			if (DrawSize.X <= LocalSize.X)
-			{
-				Result.X = 0.0f;
-			}
-			else
-			{
-				const float HalfOverflow = (DrawSize.X - LocalSize.X) * 0.5f;
-				Result.X = FMath::Clamp(Result.X, -HalfOverflow, HalfOverflow);
-			}
-			if (DrawSize.Y <= LocalSize.Y)
-			{
-				Result.Y = 0.0f;
-			}
-			else
-			{
-				const float HalfOverflow = (DrawSize.Y - LocalSize.Y) * 0.5f;
-				Result.Y = FMath::Clamp(Result.Y, -HalfOverflow, HalfOverflow);
-			}
-			return Result;
-		}
-
-		void ClampPan(FVector2f LocalSize)
-		{
-			if (ImageSize.X <= 0 || ImageSize.Y <= 0 || LocalSize.X <= 0.0f || LocalSize.Y <= 0.0f)
-			{
-				Pan = FVector2f::ZeroVector;
-				return;
-			}
-			const float FitScale = FMath::Min(LocalSize.X / ImageSize.X, LocalSize.Y / ImageSize.Y);
-			const FVector2f DrawSize = FVector2f(ImageSize) * (FitScale * Zoom);
-			Pan = ConstrainPan(LocalSize, DrawSize, Pan);
-		}
-
-		bool ComputeImageRect(FVector2f LocalSize, FVector2f& OutOrigin, FVector2f& OutDrawSize, float& OutScale) const
-		{
-			if (!Brush.IsValid() || ImageSize.X <= 0 || ImageSize.Y <= 0 || LocalSize.X <= 0 || LocalSize.Y <= 0)
-			{
-				return false;
-			}
-			const float FitScale = FMath::Min(LocalSize.X / ImageSize.X, LocalSize.Y / ImageSize.Y);
-			OutScale = FitScale * Zoom;
-			OutDrawSize = FVector2f(ImageSize) * OutScale;
-			OutOrigin = (LocalSize - OutDrawSize) * 0.5f + ConstrainPan(LocalSize, OutDrawSize, Pan);
-			return true;
-		}
-
-		FOnPixelPicked OnPixelPicked;
-		TSharedPtr<FSlateDynamicImageBrush> Brush;
-		FIntPoint ImageSize = FIntPoint::ZeroValue;
-		TArray<uint8> PixelBytes;
-		TArray<FPixelMarker> Markers;
-		FIntPoint HoveredPixel = FIntPoint::ZeroValue;
-		FVector2f Pan = FVector2f::ZeroVector;
-		FVector2f LastPanPoint = FVector2f::ZeroVector;
-		float Zoom = 1.0f;
-		bool bPanning = false;
-		bool bHasHoveredPixel = false;
-	};
-
-	struct FPixelModificationEvidence
-	{
-		uint32 EventId = 0;
-		FString Action;
-		FString ActionKind;
-		FString MarkerPath;
-		uint32 ActionFlags = 0;
-		bool bPassed = false;
-		bool bDirectShaderWrite = false;
-		bool bUnboundPixelShader = false;
-		bool bChangedTextureValue = false;
-		uint32 PrimitiveId = 0;
-		uint32 FragmentIndex = 0;
-		TArray<FString> FailureReasons;
-		FString Before;
-		FString ShaderOutput;
-		FString After;
-	};
-
-	struct FEventSummaryEvidence
-	{
-		uint32 EventId = 0;
-		FString Action;
-		FString ActionKind;
-		FString MarkerPath;
-		uint32 ActionFlags = 0;
-		int32 PassedFragments = 0;
-		int32 RejectedFragments = 0;
-		bool bDirectShaderWrite = false;
-		bool bUnboundPixelShader = false;
-		bool bChangedTextureValue = false;
-		bool bHasPrimitiveEvidence = false;
-		uint32 PrimitiveId = 0;
-		TArray<FString> FailureReasons;
-		FString Before;
-		FString ShaderOutput;
-		FString After;
-	};
-
-	struct FPixelSample
-	{
-		uint64 Id = 0;
-		FIntPoint Pixel = FIntPoint::ZeroValue;
-		bool bPending = false;
-		bool bFailed = false;
-		bool bAnalyzed = false;
-		bool bTruncated = false;
-		bool bEventSummaryComplete = false;
-		int32 TotalModifications = 0;
-		FString Error;
-		TArray<FEventSummaryEvidence> EventSummaries;
-		TArray<FPixelModificationEvidence> Modifications;
-	};
-
-	struct FEventEvidence
-	{
-		uint32 EventId = 0;
-		FString Action;
-		FString ActionKind;
-		FString MarkerPath;
-		uint32 ActionFlags = 0;
-		int32 PassedFragments = 0;
-		int32 RejectedFragments = 0;
-		int32 LastModificationIndex = INDEX_NONE;
-		bool bDirectShaderWrite = false;
-		bool bUnboundPixelShader = false;
-		bool bChangedTextureValue = false;
-		bool bHasPrimitiveEvidence = false;
-		uint32 PrimitiveId = 0;
-		TArray<FString> FailureReasons;
-		FString Before;
-		FString ShaderOutput;
-		FString After;
-	};
-
-	struct FCausalCandidate
-	{
-		FEventEvidence Event;
-		int32 SampleCoverage = 0;
-	};
-
-	struct FBoundResourceEvidence
-	{
-		FString Name;
-		FString Stage;
-		FString Access;
-		bool bTexture = false;
-		int32 Width = 0;
-		int32 Height = 0;
-		int32 Samples = 1;
-	};
-
-	struct FEventContextEvidence
-	{
-		uint32 EventId = 0;
-		FString ShaderStage;
-		FString ShaderEntry;
-		FString ShaderDebugStatus;
-		FString ShaderEncoding;
-		int32 ShaderInputSignatureCount = 0;
-		int32 ShaderOutputSignatureCount = 0;
-		int32 ShaderConstantBlockCount = 0;
-		int32 ShaderSamplerCount = 0;
-		int32 ShaderReadOnlyResourceCount = 0;
-		int32 ShaderReadWriteResourceCount = 0;
-		bool bShaderDebuggable = false;
-		bool bSourceDebugInfo = false;
-		TArray<FBoundResourceEvidence> Inputs;
-		TArray<FBoundResourceEvidence> Outputs;
-		TArray<TSharedPtr<FJsonValue>> ResourceProvenance;
-		TSharedPtr<FJsonObject> PipelineState;
-		TSharedPtr<FJsonObject> ShaderDebugTrace;
-	};
-
 	struct FRenderTrailDiagnosticsOptions
 	{
 		bool bEnabled = true;
@@ -1249,130 +706,6 @@ namespace UE::RenderTrail::Private
 			AgentMessages.Add(MakeShared<FJsonValueObject>(Message));
 		}
 
-		static bool LoadAgentPromptIni(const FString& Path, FString& OutPrompt, int32& OutLineCount)
-		{
-			OutPrompt.Empty();
-			OutLineCount = 0;
-			FString Contents;
-			if (!FFileHelper::LoadFileToString(Contents, *Path))
-			{
-				return false;
-			}
-
-			TArray<FString> Lines;
-			Contents.ParseIntoArrayLines(Lines, false);
-			bool bInPromptSection = false;
-			for (FString Line : Lines)
-			{
-				Line.TrimStartAndEndInline();
-				if (Line.IsEmpty() || Line.StartsWith(TEXT(";")) || Line.StartsWith(TEXT("#")))
-				{
-					continue;
-				}
-				if (Line.StartsWith(TEXT("[")) && Line.EndsWith(TEXT("]")))
-				{
-					bInPromptSection = Line.Mid(1, Line.Len() - 2).Equals(TEXT("RenderTrailAgentPrompt"), ESearchCase::IgnoreCase);
-					continue;
-				}
-				if (!bInPromptSection)
-				{
-					continue;
-				}
-
-				int32 Separator = INDEX_NONE;
-				if (Line.StartsWith(TEXT("+Line=")))
-				{
-					Separator = 6;
-				}
-				else if (Line.StartsWith(TEXT("Line=")))
-				{
-					Separator = 5;
-				}
-				if (Separator != INDEX_NONE)
-				{
-					FString Value = Line.Mid(Separator);
-					Value.TrimStartAndEndInline();
-					if (!Value.IsEmpty())
-					{
-						if (!OutPrompt.IsEmpty())
-						{
-							OutPrompt += TEXT("\n");
-						}
-						OutPrompt += Value;
-						++OutLineCount;
-					}
-					continue;
-				}
-
-				if (Line.StartsWith(TEXT("Prompt=")))
-				{
-					OutPrompt = Line.Mid(7).TrimStartAndEnd();
-				}
-			}
-			return !OutPrompt.IsEmpty();
-		}
-
-		FString BuildAgentSystemPrompt() const
-		{
-			TArray<FString> IniPromptPaths;
-			const FString ProjectOverridePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(
-				FPaths::ProjectConfigDir(), TEXT("RenderTrailAgentPrompt.ini")));
-			IniPromptPaths.Add(ProjectOverridePath);
-
-			FString PluginOverridePath;
-			if (const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("RenderTrail")))
-			{
-				PluginOverridePath = FPaths::ConvertRelativePathToFull(FPaths::Combine(
-					Plugin->GetBaseDir(), TEXT("Config"), TEXT("RenderTrailAgentPrompt.ini")));
-				IniPromptPaths.Add(PluginOverridePath);
-			}
-
-			for (const FString& PromptPath : IniPromptPaths)
-			{
-				if (!IFileManager::Get().FileExists(*PromptPath))
-				{
-					continue;
-				}
-
-				FString Prompt;
-				int32 PromptLineCount = 0;
-				if (LoadAgentPromptIni(PromptPath, Prompt, PromptLineCount))
-				{
-					UE_LOG(LogRenderTrailAnalyzer, Display,
-						TEXT("Loaded Agent system prompt from INI: path='%s' lines=%d chars=%d"),
-						*PromptPath, PromptLineCount, Prompt.Len());
-					return Prompt;
-				}
-			}
-
-			// Keep the previous text-file format as a migration fallback for existing projects.
-			TArray<FString> LegacyPromptPaths;
-			LegacyPromptPaths.Add(FPaths::Combine(FPaths::ProjectConfigDir(), TEXT("RenderTrailAgentPrompt.txt")));
-			if (!PluginOverridePath.IsEmpty())
-			{
-				LegacyPromptPaths.Add(FPaths::Combine(FPaths::GetPath(PluginOverridePath), TEXT("RenderTrailAgentPrompt.txt")));
-			}
-			for (const FString& PromptPath : LegacyPromptPaths)
-			{
-				FString Prompt;
-				if (IFileManager::Get().FileExists(*PromptPath) && FFileHelper::LoadFileToString(Prompt, *PromptPath))
-				{
-					Prompt.TrimStartAndEndInline();
-					if (!Prompt.IsEmpty())
-					{
-						UE_LOG(LogRenderTrailAnalyzer, Display,
-							TEXT("Loaded legacy text Agent system prompt: path='%s' chars=%d"), *PromptPath, Prompt.Len());
-						return Prompt;
-					}
-				}
-			}
-
-			UE_LOG(LogRenderTrailAnalyzer, Warning,
-				TEXT("Agent system prompt INI was not found or empty; using safe fallback. Expected project='%s' plugin='%s'."),
-				*ProjectOverridePath, *PluginOverridePath);
-			return TEXT("You are RenderTrail's read-only selected-pixel forensics agent. Respond in Chinese with exactly one finish JSON object. Use only supplied RenderDoc evidence, answer HUMAN_REQUEST directly, distinguish observed GPU formation from unknown upstream causes, never invent shader algorithms or shadow state, and list missing evidence in unknowns.");
-		}
-
 		FString BuildAgentPrefilterEvidence() const
 		{
 			TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -1427,6 +760,7 @@ namespace UE::RenderTrail::Private
 					EventJson->SetStringField(TEXT("result"), DescribeEventResult(Event));
 					EventJson->SetNumberField(TEXT("passedFragments"), Event.PassedFragments);
 					EventJson->SetNumberField(TEXT("rejectedFragments"), Event.RejectedFragments);
+					AddColorDeltaJson(EventJson, Event);
 					EventValues.Add(MakeShared<FJsonValueObject>(EventJson));
 				}
 				SampleJson->SetArrayField(TEXT("latestRelevantEvents"), EventValues);
@@ -1453,6 +787,7 @@ namespace UE::RenderTrail::Private
 					EventJson->SetBoolField(TEXT("changedTextureValue"), Event.bChangedTextureValue);
 					EventJson->SetBoolField(TEXT("hasPrimitiveEvidence"), Event.bHasPrimitiveEvidence);
 					EventJson->SetNumberField(TEXT("primitiveId"), Event.PrimitiveId);
+					AddColorDeltaJson(EventJson, Event);
 					TArray<TSharedPtr<FJsonValue>> FailureValues;
 					for (const FString& Failure : Event.FailureReasons)
 					{
@@ -1465,6 +800,8 @@ namespace UE::RenderTrail::Private
 				SampleJson->SetBoolField(TEXT("eventChainComplete"), Sample.bEventSummaryComplete && AgentChainFirst == 0);
 				SampleJson->SetNumberField(TEXT("eventChainEventCount"), Events.Num());
 				SampleJson->SetNumberField(TEXT("eventChainStartIndex"), AgentChainFirst);
+				SampleJson->SetObjectField(TEXT("causalGraph"),
+					BuildPixelCausalGraph(Sample, Events, EventContexts, MaxDisplayedFrontierResources));
 				SampleValues.Add(MakeShared<FJsonValueObject>(SampleJson));
 			}
 			Root->SetArrayField(TEXT("samples"), SampleValues);
@@ -1479,9 +816,26 @@ namespace UE::RenderTrail::Private
 				CandidateJson->SetStringField(TEXT("semantics"), ClassifySemantics(Candidate.Event));
 				CandidateJson->SetStringField(TEXT("marker"), CompactMarkerPath(Candidate.Event.MarkerPath));
 				CandidateJson->SetStringField(TEXT("result"), DescribeEventResult(Candidate.Event));
+				CandidateJson->SetStringField(TEXT("causalRole"), TEXT("final-writer"));
+				AddColorDeltaJson(CandidateJson, Candidate.Event);
 				CandidateJson->SetBoolField(TEXT("pointDivergence"), bLastCandidateHasDivergence);
 				CandidateJson->SetNumberField(TEXT("sampleCoverage"), Candidate.SampleCoverage);
 				Root->SetObjectField(TEXT("candidate"), CandidateJson);
+				Root->SetObjectField(TEXT("finalWriter"), CandidateJson);
+			}
+			if (LastSignificantCandidate.IsSet())
+			{
+				const FCausalCandidate& Candidate = LastSignificantCandidate.GetValue();
+				TSharedRef<FJsonObject> CandidateJson = MakeShared<FJsonObject>();
+				CandidateJson->SetNumberField(TEXT("eventId"), Candidate.Event.EventId);
+				CandidateJson->SetStringField(TEXT("action"), Candidate.Event.Action);
+				CandidateJson->SetStringField(TEXT("kind"), Candidate.Event.ActionKind);
+				CandidateJson->SetStringField(TEXT("semantics"), ClassifySemantics(Candidate.Event));
+				CandidateJson->SetStringField(TEXT("marker"), CompactMarkerPath(Candidate.Event.MarkerPath));
+				CandidateJson->SetStringField(TEXT("result"), DescribeEventResult(Candidate.Event));
+				CandidateJson->SetStringField(TEXT("causalRole"), TEXT("significant-upstream-writer-candidate"));
+				AddColorDeltaJson(CandidateJson, Candidate.Event);
+				Root->SetObjectField(TEXT("significantWriterCandidate"), CandidateJson);
 			}
 
 			TArray<TSharedPtr<FJsonValue>> DeterministicContexts;
@@ -1490,6 +844,10 @@ namespace UE::RenderTrail::Private
 				const FEventContextEvidence& Context = Pair.Value;
 				TSharedRef<FJsonObject> ContextJson = MakeShared<FJsonObject>();
 				ContextJson->SetNumberField(TEXT("eventId"), Context.EventId);
+				ContextJson->SetStringField(TEXT("action"), Context.Action);
+				ContextJson->SetStringField(TEXT("actionKind"), Context.ActionKind);
+				ContextJson->SetStringField(TEXT("marker"), CompactMarkerPath(Context.MarkerPath));
+				ContextJson->SetNumberField(TEXT("reverseDepth"), EventContextDepths.FindRef(Context.EventId));
 				ContextJson->SetStringField(TEXT("shaderStage"), Context.ShaderStage);
 				ContextJson->SetStringField(TEXT("shaderEntry"), Context.ShaderEntry);
 				ContextJson->SetStringField(TEXT("shaderDebugStatus"), Context.ShaderDebugStatus);
@@ -1514,7 +872,9 @@ namespace UE::RenderTrail::Private
 				for (const FBoundResourceEvidence& Input : Context.Inputs)
 				{
 					TSharedRef<FJsonObject> Resource = MakeShared<FJsonObject>();
+					Resource->SetNumberField(TEXT("resourceIndex"), Input.ResourceIndex);
 					Resource->SetStringField(TEXT("name"), Input.Name);
+					Resource->SetStringField(TEXT("format"), Input.Format);
 					Resource->SetStringField(TEXT("stage"), Input.Stage);
 					Resource->SetStringField(TEXT("access"), Input.Access);
 					Resource->SetNumberField(TEXT("width"), Input.Width);
@@ -1526,7 +886,9 @@ namespace UE::RenderTrail::Private
 				for (const FBoundResourceEvidence& Output : Context.Outputs)
 				{
 					TSharedRef<FJsonObject> Resource = MakeShared<FJsonObject>();
+					Resource->SetNumberField(TEXT("resourceIndex"), Output.ResourceIndex);
 					Resource->SetStringField(TEXT("name"), Output.Name);
+					Resource->SetStringField(TEXT("format"), Output.Format);
 					Resource->SetStringField(TEXT("stage"), Output.Stage);
 					Resource->SetStringField(TEXT("access"), Output.Access);
 					Resource->SetNumberField(TEXT("width"), Output.Width);
@@ -1769,7 +1131,7 @@ namespace UE::RenderTrail::Private
 			const FString UserMessage = FString(TEXT("HUMAN_REQUEST\n")) + HumanRequest
 				+ TEXT("\n\nPREFILTERED_EVIDENCE\n") + PrefilterEvidence;
 			WriteAgentLog(TEXT("HumanRequest"), HumanRequest);
-			AddAgentMessage(TEXT("system"), BuildAgentSystemPrompt());
+			AddAgentMessage(TEXT("system"), LoadRenderTrailAgentSystemPrompt());
 			AddAgentMessage(TEXT("user"), UserMessage);
 			SendAgentTurn();
 			return FReply::Handled();
@@ -2928,6 +2290,7 @@ namespace UE::RenderTrail::Private
 		{
 			CancelAgentRun();
 			LastCandidate.Reset();
+			LastSignificantCandidate.Reset();
 			bLastCandidateHasDivergence = false;
 			const bool bHasSelection = !Samples.IsEmpty();
 			SetAgentOutputText(bHasSelection
@@ -2979,10 +2342,12 @@ namespace UE::RenderTrail::Private
 			if (bSelectionChanged)
 			{
 				EventContexts.Empty();
+				EventContextDepths.Empty();
 				PendingEventContextByRequest.Empty();
 				PendingEventContextIds.Empty();
 				FailedEventContextIds.Empty();
 				LastCandidate.Reset();
+				LastSignificantCandidate.Reset();
 				bLastCandidateHasDivergence = false;
 			}
 
@@ -3048,12 +2413,14 @@ namespace UE::RenderTrail::Private
 			Samples.Empty();
 			PendingSampleByRequest.Empty();
 			EventContexts.Empty();
+			EventContextDepths.Empty();
 			PendingEventContextByRequest.Empty();
 			PendingShaderDebugByRequest.Empty();
 			PendingEventContextIds.Empty();
 			FailedEventContextIds.Empty();
 			FailedShaderDebugIds.Empty();
 			LastCandidate.Reset();
+			LastSignificantCandidate.Reset();
 			bLastCandidateHasDivergence = false;
 			SetAgentOutputText(TEXT("选择像素后，可运行 Agent 生成 Mesh、颜色和渲染过程摘要。"));
 			SetAgentStatus(TEXT("未运行 · 只发送像素摘要；.rdc/图像不上传；Key 不落盘"));
@@ -3891,44 +3258,6 @@ namespace UE::RenderTrail::Private
 			}
 		}
 
-		static FString FormatFloatValue(const TSharedPtr<FJsonObject>& Value)
-		{
-			if (!Value.IsValid() || !Value->GetBoolField(TEXT("valid")))
-			{
-				return TEXT("<unavailable>");
-			}
-			const TArray<TSharedPtr<FJsonValue>>& Components = Value->GetArrayField(TEXT("float"));
-			TArray<FString> Text;
-			for (const TSharedPtr<FJsonValue>& Component : Components)
-			{
-				Text.Add(Component->Type == EJson::Null ? TEXT("NaN") : FString::Printf(TEXT("%.6g"), Component->AsNumber()));
-			}
-			return FString::Printf(TEXT("RGBA (%s)  depth %.6g  stencil %d"), *FString::Join(Text, TEXT(", ")),
-				Value->HasTypedField<EJson::Number>(TEXT("depth")) ? Value->GetNumberField(TEXT("depth")) : 0.0,
-				static_cast<int32>(Value->GetNumberField(TEXT("stencil"))));
-		}
-
-		static FBoundResourceEvidence ParseBoundResource(const TSharedPtr<FJsonObject>& Json)
-		{
-			FBoundResourceEvidence Resource;
-			if (!Json.IsValid())
-			{
-				return Resource;
-			}
-			Json->TryGetStringField(TEXT("name"), Resource.Name);
-			Json->TryGetStringField(TEXT("stage"), Resource.Stage);
-			Json->TryGetStringField(TEXT("access"), Resource.Access);
-			Json->TryGetBoolField(TEXT("texture"), Resource.bTexture);
-			double Number = 0.0;
-			if (Json->TryGetNumberField(TEXT("width"), Number))
-				Resource.Width = static_cast<int32>(Number);
-			if (Json->TryGetNumberField(TEXT("height"), Number))
-				Resource.Height = static_cast<int32>(Number);
-			if (Json->TryGetNumberField(TEXT("samples"), Number))
-				Resource.Samples = static_cast<int32>(Number);
-			return Resource;
-		}
-
 		void StoreEventContext(const TSharedRef<FJsonObject>& Message)
 		{
 			FString RequestId;
@@ -3946,6 +3275,9 @@ namespace UE::RenderTrail::Private
 
 			FEventContextEvidence Context;
 			Context.EventId = EventId;
+			Message->TryGetStringField(TEXT("action"), Context.Action);
+			Message->TryGetStringField(TEXT("actionKind"), Context.ActionKind);
+			Message->TryGetStringField(TEXT("markerPath"), Context.MarkerPath);
 			Message->TryGetStringField(TEXT("shaderStage"), Context.ShaderStage);
 			Message->TryGetStringField(TEXT("shaderEntry"), Context.ShaderEntry);
 			Message->TryGetStringField(TEXT("shaderDebugStatus"), Context.ShaderDebugStatus);
@@ -3984,6 +3316,7 @@ namespace UE::RenderTrail::Private
 				Context.ResourceProvenance = *Provenance;
 			}
 			EventContexts.Add(EventId, MoveTemp(Context));
+			ScheduleProducerEventContexts(EventContexts.FindChecked(EventId));
 			RenderCausalReport();
 			ResumeAgentAfterEventContext(EventId);
 			SetStatus(FString::Printf(TEXT("Event %u 的 Pipeline、资源绑定和 Shader 反射已加载；详细内容可展开查看。"), EventId));
@@ -4010,10 +3343,22 @@ namespace UE::RenderTrail::Private
 			TryResumeAgentAfterDeterministicContexts();
 		}
 
-		void EnsureEventContext(uint32 EventId)
+		void EnsureEventContext(uint32 EventId, int32 ReverseDepth = 0)
 		{
-			if (!bWorkerReady || EventContexts.Contains(EventId)
-				|| PendingEventContextIds.Contains(EventId) || FailedEventContextIds.Contains(EventId))
+			if (!bWorkerReady || FailedEventContextIds.Contains(EventId))
+			{
+				return;
+			}
+			if (int32* ExistingDepth = EventContextDepths.Find(EventId))
+			{
+				*ExistingDepth = FMath::Min(*ExistingDepth, ReverseDepth);
+			}
+			else
+			{
+				EventContextDepths.Add(EventId, ReverseDepth);
+			}
+			if (EventContexts.Contains(EventId) || PendingEventContextIds.Contains(EventId)
+				|| EventContexts.Num() + PendingEventContextIds.Num() >= MaxDeterministicContextEvents)
 			{
 				return;
 			}
@@ -4027,6 +3372,47 @@ namespace UE::RenderTrail::Private
 				});
 		}
 
+		void ScheduleProducerEventContexts(const FEventContextEvidence& Context)
+		{
+			const int32 ConsumerDepth = EventContextDepths.FindRef(Context.EventId);
+			if (ConsumerDepth >= MaxCausalGraphHops - 1)
+			{
+				return;
+			}
+
+			int32 ScheduledForConsumer = 0;
+			for (const TSharedPtr<FJsonValue>& ProvenanceValue : Context.ResourceProvenance)
+			{
+				if (ScheduledForConsumer >= MaxRecursiveProducerContextsPerEvent
+					|| EventContexts.Num() + PendingEventContextIds.Num() >= MaxDeterministicContextEvents)
+				{
+					break;
+				}
+				const TSharedPtr<FJsonObject> Provenance = ProvenanceValue.IsValid() ? ProvenanceValue->AsObject() : nullptr;
+				if (!Provenance.IsValid())
+				{
+					continue;
+				}
+				bool bProducerFound = false;
+				FString ProducerStatus;
+				double ProducerEventId = 0.0;
+				Provenance->TryGetBoolField(TEXT("producerFound"), bProducerFound);
+				Provenance->TryGetStringField(TEXT("producerStatus"), ProducerStatus);
+				Provenance->TryGetNumberField(TEXT("producerEventId"), ProducerEventId);
+				if (!bProducerFound || ProducerStatus != TEXT("confirmed-resource-write") || ProducerEventId <= 0.0)
+				{
+					continue;
+				}
+				const uint32 EventId = static_cast<uint32>(ProducerEventId);
+				if (EventId == Context.EventId)
+				{
+					continue;
+				}
+				EnsureEventContext(EventId, ConsumerDepth + 1);
+				++ScheduledForConsumer;
+			}
+		}
+
 		void EnsureRelevantEventContexts()
 		{
 			if (!bWorkerReady)
@@ -4035,6 +3421,7 @@ namespace UE::RenderTrail::Private
 			}
 
 			TArray<uint32> RelevantEventIds;
+			int32 WriterContextCount = 0;
 			for (const FPixelSample& Sample : Samples)
 			{
 				const TArray<FEventEvidence> Events = AggregateEvents(Sample);
@@ -4046,12 +3433,13 @@ namespace UE::RenderTrail::Private
 						continue;
 					}
 					RelevantEventIds.AddUnique(Event.EventId);
-					if (RelevantEventIds.Num() >= MaxDeterministicContextEvents)
+					++WriterContextCount;
+					if (WriterContextCount >= MaxCausalGraphHops)
 					{
 						break;
 					}
 				}
-				if (RelevantEventIds.Num() >= MaxDeterministicContextEvents)
+				if (WriterContextCount >= MaxCausalGraphHops)
 				{
 					break;
 				}
@@ -4059,7 +3447,7 @@ namespace UE::RenderTrail::Private
 			for (const FPixelSample& Sample : Samples)
 			{
 				const TArray<FEventEvidence> Events = AggregateEvents(Sample);
-				for (int32 Index = Events.Num() - 1; Index >= 0 && RelevantEventIds.Num() < MaxDeterministicContextEvents; --Index)
+				for (int32 Index = Events.Num() - 1; Index >= 0 && RelevantEventIds.Num() < MaxInitialEventContexts; --Index)
 				{
 					const FEventEvidence& Event = Events[Index];
 					if (Event.ActionKind != TEXT("present") && !IsConfirmedPixelWriter(Event))
@@ -4081,58 +3469,69 @@ namespace UE::RenderTrail::Private
 			{
 				return;
 			}
-			const FEventEvidence& Candidate = LastCandidate->Event;
-			if (Candidate.ActionKind != TEXT("draw") || FailedShaderDebugIds.Contains(Candidate.EventId))
+
+			TArray<FEventEvidence> DebugCandidates;
+			DebugCandidates.Add(LastCandidate->Event);
+			if (LastSignificantCandidate.IsSet()
+				&& LastSignificantCandidate->Event.EventId != LastCandidate->Event.EventId)
 			{
-				return;
-			}
-			if (const FEventContextEvidence* Context = EventContexts.Find(Candidate.EventId))
-			{
-				if (Context->ShaderDebugTrace.IsValid())
-				{
-					return;
-				}
-			}
-			bool bShaderDebugPending = false;
-			for (const TPair<FString, uint32>& Pair : PendingShaderDebugByRequest)
-			{
-				if (Pair.Value == Candidate.EventId)
-				{
-					bShaderDebugPending = true;
-					break;
-				}
-			}
-			if (bShaderDebugPending)
-			{
-				return;
+				DebugCandidates.Add(LastSignificantCandidate->Event);
 			}
 
-			const FPixelSample* SourceSample = nullptr;
-			for (const FPixelSample& Sample : Samples)
+			for (const FEventEvidence& Candidate : DebugCandidates)
 			{
-				const TArray<FEventEvidence> Events = AggregateEvents(Sample);
-				if (FindEvent(Events, Candidate.EventId))
+				if (Candidate.ActionKind != TEXT("draw") || FailedShaderDebugIds.Contains(Candidate.EventId))
 				{
-					SourceSample = &Sample;
-					break;
+					continue;
 				}
-			}
-			if (!SourceSample)
-			{
-				return;
-			}
-
-			const FString RequestId = FString::Printf(TEXT("shader-debug-%u-query-%llu"), Candidate.EventId, ++RequestSerial);
-			PendingShaderDebugByRequest.Add(RequestId, Candidate.EventId);
-			SendWorkerRequest(TEXT("shader_debug"), RequestId,
-				[&Candidate, SourceSample](const TSharedRef<FJsonObject>& Request)
+				if (const FEventContextEvidence* Context = EventContexts.Find(Candidate.EventId))
 				{
-					Request->SetNumberField(TEXT("eventId"), Candidate.EventId);
-					Request->SetNumberField(TEXT("x"), SourceSample->Pixel.X);
-					Request->SetNumberField(TEXT("y"), SourceSample->Pixel.Y);
-					Request->SetNumberField(TEXT("primitiveId"), Candidate.PrimitiveId);
-					Request->SetBoolField(TEXT("hasPrimitive"), Candidate.bHasPrimitiveEvidence);
-				});
+					if (Context->ShaderDebugTrace.IsValid())
+					{
+						continue;
+					}
+				}
+				bool bShaderDebugPending = false;
+				for (const TPair<FString, uint32>& Pair : PendingShaderDebugByRequest)
+				{
+					if (Pair.Value == Candidate.EventId)
+					{
+						bShaderDebugPending = true;
+						break;
+					}
+				}
+				if (bShaderDebugPending)
+				{
+					continue;
+				}
+
+				const FPixelSample* SourceSample = nullptr;
+				for (const FPixelSample& Sample : Samples)
+				{
+					const TArray<FEventEvidence> Events = AggregateEvents(Sample);
+					if (FindEvent(Events, Candidate.EventId))
+					{
+						SourceSample = &Sample;
+						break;
+					}
+				}
+				if (!SourceSample)
+				{
+					continue;
+				}
+
+				const FString RequestId = FString::Printf(TEXT("shader-debug-%u-query-%llu"), Candidate.EventId, ++RequestSerial);
+				PendingShaderDebugByRequest.Add(RequestId, Candidate.EventId);
+				SendWorkerRequest(TEXT("shader_debug"), RequestId,
+					[Candidate, SourceSample](const TSharedRef<FJsonObject>& Request)
+					{
+						Request->SetNumberField(TEXT("eventId"), Candidate.EventId);
+						Request->SetNumberField(TEXT("x"), SourceSample->Pixel.X);
+						Request->SetNumberField(TEXT("y"), SourceSample->Pixel.Y);
+						Request->SetNumberField(TEXT("primitiveId"), Candidate.PrimitiveId);
+						Request->SetBoolField(TEXT("hasPrimitive"), Candidate.bHasPrimitiveEvidence);
+					});
+			}
 		}
 
 		void TryResumeAgentAfterDeterministicContexts()
@@ -4207,9 +3606,12 @@ namespace UE::RenderTrail::Private
 					{
 						Evidence.FailureReasons.AddUnique(Failure->AsString());
 					}
-					Evidence.Before = FormatFloatValue(Summary->GetObjectField(TEXT("firstBefore")));
-					Evidence.ShaderOutput = FormatFloatValue(Summary->GetObjectField(TEXT("lastShaderOutput")));
-					Evidence.After = FormatFloatValue(Summary->GetObjectField(TEXT("lastAfter")));
+					Evidence.BeforeValue = ParsePixelValue(Summary->GetObjectField(TEXT("firstBefore")));
+					Evidence.ShaderOutputValue = ParsePixelValue(Summary->GetObjectField(TEXT("lastShaderOutput")));
+					Evidence.AfterValue = ParsePixelValue(Summary->GetObjectField(TEXT("lastAfter")));
+					Evidence.Before = Evidence.BeforeValue.Text;
+					Evidence.ShaderOutput = Evidence.ShaderOutputValue.Text;
+					Evidence.After = Evidence.AfterValue.Text;
 					Sample->EventSummaries.Add(MoveTemp(Evidence));
 				}
 			}
@@ -4236,9 +3638,12 @@ namespace UE::RenderTrail::Private
 				{
 					Evidence.FailureReasons.Add(Failure->AsString());
 				}
-				Evidence.Before = FormatFloatValue(Modification->GetObjectField(TEXT("before")));
-				Evidence.ShaderOutput = FormatFloatValue(Modification->GetObjectField(TEXT("shaderOutput")));
-				Evidence.After = FormatFloatValue(Modification->GetObjectField(TEXT("after")));
+				Evidence.BeforeValue = ParsePixelValue(Modification->GetObjectField(TEXT("before")));
+				Evidence.ShaderOutputValue = ParsePixelValue(Modification->GetObjectField(TEXT("shaderOutput")));
+				Evidence.AfterValue = ParsePixelValue(Modification->GetObjectField(TEXT("after")));
+				Evidence.Before = Evidence.BeforeValue.Text;
+				Evidence.ShaderOutput = Evidence.ShaderOutputValue.Text;
+				Evidence.After = Evidence.AfterValue.Text;
 				if (Evidence.Action.IsEmpty())
 				{
 					Evidence.Action = TEXT("Unnamed action");
@@ -4266,148 +3671,6 @@ namespace UE::RenderTrail::Private
 			const int32 SampleIndex = Samples.IndexOfByPredicate([CompletedSampleId](const FPixelSample& Item) { return Item.Id == CompletedSampleId; });
 			SetStatus(FString::Printf(TEXT("关注点 P%d (%d, %d)：%d 个 RenderDoc modification，分析已刷新。"),
 				SampleIndex + 1, Sample->Pixel.X, Sample->Pixel.Y, Sample->TotalModifications));
-		}
-
-		static TArray<FEventEvidence> AggregateEvents(const FPixelSample& Sample)
-		{
-			TArray<FEventEvidence> Events;
-			if (Sample.bEventSummaryComplete)
-			{
-				Events.Reserve(Sample.EventSummaries.Num());
-				for (const FEventSummaryEvidence& Summary : Sample.EventSummaries)
-				{
-					FEventEvidence Event;
-					Event.EventId = Summary.EventId;
-					Event.Action = Summary.Action;
-					Event.ActionKind = Summary.ActionKind;
-					Event.MarkerPath = Summary.MarkerPath;
-					Event.ActionFlags = Summary.ActionFlags;
-					Event.PassedFragments = Summary.PassedFragments;
-					Event.RejectedFragments = Summary.RejectedFragments;
-					Event.bDirectShaderWrite = Summary.bDirectShaderWrite;
-					Event.bUnboundPixelShader = Summary.bUnboundPixelShader;
-					Event.bChangedTextureValue = Summary.bChangedTextureValue;
-					Event.bHasPrimitiveEvidence = Summary.bHasPrimitiveEvidence;
-					Event.PrimitiveId = Summary.PrimitiveId;
-					Event.FailureReasons = Summary.FailureReasons;
-					Event.Before = Summary.Before;
-					Event.ShaderOutput = Summary.ShaderOutput;
-					Event.After = Summary.After;
-					Events.Add(MoveTemp(Event));
-				}
-				return Events;
-			}
-
-			TMap<uint32, int32> EventIndex;
-			for (int32 ModificationIndex = 0; ModificationIndex < Sample.Modifications.Num(); ++ModificationIndex)
-			{
-				const FPixelModificationEvidence& Modification = Sample.Modifications[ModificationIndex];
-				int32* ExistingIndex = EventIndex.Find(Modification.EventId);
-				if (!ExistingIndex)
-				{
-					FEventEvidence Event;
-					Event.EventId = Modification.EventId;
-					Event.Action = Modification.Action;
-					Event.ActionKind = Modification.ActionKind;
-					Event.MarkerPath = Modification.MarkerPath;
-					Event.ActionFlags = Modification.ActionFlags;
-					Event.Before = Modification.Before;
-					EventIndex.Add(Event.EventId, Events.Add(MoveTemp(Event)));
-					ExistingIndex = EventIndex.Find(Modification.EventId);
-				}
-				FEventEvidence& Event = Events[*ExistingIndex];
-				Event.PassedFragments += Modification.bPassed ? 1 : 0;
-				Event.RejectedFragments += Modification.bPassed ? 0 : 1;
-				Event.LastModificationIndex = ModificationIndex;
-				Event.bDirectShaderWrite |= Modification.bDirectShaderWrite;
-				Event.bUnboundPixelShader |= Modification.bUnboundPixelShader;
-				Event.bChangedTextureValue |= Modification.bChangedTextureValue;
-				Event.bHasPrimitiveEvidence = true;
-				Event.PrimitiveId = Modification.PrimitiveId;
-				Event.ShaderOutput = Modification.ShaderOutput;
-				Event.After = Modification.After;
-				for (const FString& Failure : Modification.FailureReasons)
-				{
-					Event.FailureReasons.AddUnique(Failure);
-				}
-			}
-			return Events;
-		}
-
-		static const FEventEvidence* FindEvent(const TArray<FEventEvidence>& Events, uint32 EventId)
-		{
-			return Events.FindByPredicate([EventId](const FEventEvidence& Event) { return Event.EventId == EventId; });
-		}
-
-		static FString DescribeEventResult(const FEventEvidence& Event)
-		{
-			if (Event.bDirectShaderWrite)
-			{
-				return Event.bChangedTextureValue ? TEXT("potential UAV/shader write changed value") : TEXT("potential UAV/shader write, no value change");
-			}
-			if (Event.PassedFragments > 0)
-			{
-				return FString::Printf(TEXT("%d fragment%s wrote; %d rejected"), Event.PassedFragments,
-					Event.PassedFragments == 1 ? TEXT("") : TEXT("s"), Event.RejectedFragments);
-			}
-			return Event.FailureReasons.IsEmpty()
-				? TEXT("did not write")
-				: FString::Printf(TEXT("rejected: %s"), *FString::Join(Event.FailureReasons, TEXT(", ")));
-		}
-
-		static bool IsConfirmedPixelWriter(const FEventEvidence& Event)
-		{
-			return Event.PassedFragments > 0 || (Event.bDirectShaderWrite && Event.bChangedTextureValue);
-		}
-
-		static FString ClassifySemantics(const FEventEvidence& Event)
-		{
-			if (Event.bDirectShaderWrite || Event.ActionKind == TEXT("dispatch"))
-			{
-				return TEXT("compute/UAV");
-			}
-			if (Event.ActionKind == TEXT("copy") || Event.ActionKind == TEXT("resolve"))
-			{
-				return TEXT("copy/resolve");
-			}
-			if (Event.ActionKind == TEXT("clear"))
-			{
-				return TEXT("clear/load");
-			}
-			FString SemanticContext = Event.Action;
-			TArray<FString> PathComponents;
-			Event.MarkerPath.ParseIntoArray(PathComponents, TEXT(" > "), true);
-			const int32 FirstRelevantPath = FMath::Max(0, PathComponents.Num() - 3);
-			for (int32 Index = FirstRelevantPath; Index < PathComponents.Num(); ++Index)
-			{
-				SemanticContext += TEXT(" ") + PathComponents[Index];
-			}
-			const FString Context = SemanticContext.ToLower();
-			if (Context.Contains(TEXT("temporalsuperresolution")) || Context.Contains(TEXT("upscale"))
-				|| Context.Contains(TEXT("downsample")) || Context.Contains(TEXT("upsample"))
-				|| Context.Contains(TEXT("resample")))
-			{
-				return TEXT("resample/nonlinear");
-			}
-			if (Context.Contains(TEXT("postprocessing")) || Context.Contains(TEXT("tonemap"))
-				|| Context.Contains(TEXT("bloom")) || Context.Contains(TEXT("composite"))
-				|| Context.Contains(TEXT("screenpass")))
-			{
-				return TEXT("post-process");
-			}
-			return Event.ActionKind == TEXT("draw") ? TEXT("scene-write") : TEXT("unclassified");
-		}
-
-		static FString CompactMarkerPath(const FString& MarkerPath)
-		{
-			TArray<FString> Components;
-			MarkerPath.ParseIntoArray(Components, TEXT(" > "), true);
-			if (Components.Num() <= 4)
-			{
-				return MarkerPath;
-			}
-			return FString::Printf(TEXT("%s > ... > %s > %s > %s"), *Components[0],
-				*Components[Components.Num() - 3], *Components[Components.Num() - 2], *Components[Components.Num() - 1]);
 		}
 
 		static FString FormatPipelineStateEvidence(const TSharedPtr<FJsonObject>& PipelineState)
@@ -4681,6 +3944,40 @@ namespace UE::RenderTrail::Private
 					}
 				}
 			}
+			const TSharedPtr<FJsonObject>* ShaderCodeEvidence = nullptr;
+			if (Trace->TryGetObjectField(TEXT("shaderCodeEvidence"), ShaderCodeEvidence)
+				&& ShaderCodeEvidence && ShaderCodeEvidence->IsValid())
+			{
+				FString CodeStatus;
+				(*ShaderCodeEvidence)->TryGetStringField(TEXT("status"), CodeStatus);
+				Report += FString::Printf(TEXT("  Shader 代码证据：%s（DebugPixel 指令映射的反汇编窗口）\n"),
+					CodeStatus.IsEmpty() ? TEXT("unknown") : *CodeStatus);
+				const TArray<TSharedPtr<FJsonValue>>* CodeLines = nullptr;
+				if ((*ShaderCodeEvidence)->TryGetArrayField(TEXT("lines"), CodeLines) && CodeLines)
+				{
+					int32 ShownCodeLines = 0;
+					for (const TSharedPtr<FJsonValue>& Value : *CodeLines)
+					{
+						const TSharedPtr<FJsonObject> Line = Value.IsValid() ? Value->AsObject() : nullptr;
+						if (!Line.IsValid())
+						{
+							continue;
+						}
+						double Instruction = 0.0;
+						double DisassemblyLine = 0.0;
+						FString Code;
+						Line->TryGetNumberField(TEXT("instruction"), Instruction);
+						Line->TryGetNumberField(TEXT("disassemblyLine"), DisassemblyLine);
+						Line->TryGetStringField(TEXT("text"), Code);
+						Report += FString::Printf(TEXT("    i%d / line %d: %s\n"), static_cast<int32>(Instruction),
+							static_cast<int32>(DisassemblyLine), *Code);
+						if (++ShownCodeLines >= 8)
+						{
+							break;
+						}
+					}
+				}
+			}
 			const TArray<TSharedPtr<FJsonValue>>* TraceStates = nullptr;
 			if (Trace->TryGetArrayField(TEXT("traceStateSamples"), TraceStates) && TraceStates)
 			{
@@ -4781,6 +4078,7 @@ namespace UE::RenderTrail::Private
 		void RenderCausalReport()
 		{
 			LastCandidate.Reset();
+			LastSignificantCandidate.Reset();
 			bLastCandidateHasDivergence = false;
 			if (Samples.IsEmpty())
 			{
@@ -4876,6 +4174,7 @@ namespace UE::RenderTrail::Private
 
 			FCausalCandidate Candidate;
 			bool bHasCandidate = false;
+			int32 FinalWriterIndex = INDEX_NONE;
 			if (BaseEvents)
 			{
 				for (int32 EventIndex = BaseEvents->Num() - 1; EventIndex >= 0; --EventIndex)
@@ -4889,6 +4188,7 @@ namespace UE::RenderTrail::Private
 					Candidate.Event = Event;
 					Candidate.SampleCoverage = 1;
 					bHasCandidate = true;
+					FinalWriterIndex = EventIndex;
 					break;
 				}
 			}
@@ -4897,6 +4197,24 @@ namespace UE::RenderTrail::Private
 			{
 				LastCandidate = Candidate;
 				bLastCandidateHasDivergence = false;
+				if (Candidate.Event.ColorDeltaMax >= 0.0
+					&& Candidate.Event.ColorDeltaMax < SignificantColorDeltaThreshold && BaseEvents)
+				{
+					for (int32 EventIndex = FinalWriterIndex - 1; EventIndex >= 0; --EventIndex)
+					{
+						const FEventEvidence& Event = (*BaseEvents)[EventIndex];
+						if (!IsConfirmedPixelWriter(Event) || Event.ActionKind == TEXT("present")
+							|| Event.ColorDeltaMax < SignificantColorDeltaThreshold)
+						{
+							continue;
+						}
+						FCausalCandidate SignificantCandidate;
+						SignificantCandidate.Event = Event;
+						SignificantCandidate.SampleCoverage = 1;
+						LastSignificantCandidate = MoveTemp(SignificantCandidate);
+						break;
+					}
+				}
 			}
 			EnsureRelevantEventContexts();
 			EnsureCandidateShaderDebug();
@@ -4944,19 +4262,55 @@ namespace UE::RenderTrail::Private
 			if (bHasCandidate)
 			{
 				const FString Semantics = ClassifySemantics(Candidate.Event);
-				Summary = FString::Printf(
-					TEXT("P1 的末端可追踪候选是 EID %u。它解释实际形成过程，但单点证据不能判断视觉结果是否符合设计意图。"),
-					Candidate.Event.EventId);
-
-				CausalPath += FString::Printf(TEXT("\n↓\n末端候选 EID %u · %s\n↓\n■ GPU 因果边界：%s"),
-					Candidate.Event.EventId, *Candidate.Event.Action,
+				const bool bDeltaKnown = Candidate.Event.ColorDeltaMax >= 0.0;
+				const bool bMinorFinalAdjustment = bDeltaKnown
+					&& Candidate.Event.ColorDeltaMax < SignificantColorDeltaThreshold;
+				if (!bDeltaKnown)
+				{
+					Summary = FString::Printf(TEXT("EID %u 是 P1 的最后物理写入者，但 Before/After 数值不完整，当前不能判断它是末端微调还是主要颜色形成事件。"),
+						Candidate.Event.EventId);
+					CausalPath += FString::Printf(TEXT("\n↓\n最后写入 EID %u · %s（颜色差值不可用）"),
+						Candidate.Event.EventId, *Candidate.Event.Action);
+				}
+				else if (bMinorFinalAdjustment)
+				{
+					Summary = LastSignificantCandidate.IsSet()
+						? FString::Printf(TEXT("EID %u 是 P1 的最后物理写入者，但最大颜色变化仅 %.6g，属于末端微调；更早的 EID %u 是当前最近的显著写入候选，颜色形成原因仍需沿资源依赖继续证明。"),
+							Candidate.Event.EventId, Candidate.Event.ColorDeltaMax, LastSignificantCandidate->Event.EventId)
+						: FString::Printf(TEXT("EID %u 是 P1 的最后物理写入者，但最大颜色变化仅 %.6g，属于末端微调；当前链中尚未找到可确认的显著上游写入。"),
+							Candidate.Event.EventId, Candidate.Event.ColorDeltaMax);
+					CausalPath += FString::Printf(TEXT("\n↓\n最后写入 EID %u · %s（末端微调，Δmax=%.6g）"),
+						Candidate.Event.EventId, *Candidate.Event.Action, Candidate.Event.ColorDeltaMax);
+					if (LastSignificantCandidate.IsSet())
+					{
+						CausalPath += FString::Printf(TEXT("\n↓ 继续反向追踪\n显著写入候选 EID %u · %s（Δmax=%.6g）"),
+							LastSignificantCandidate->Event.EventId, *LastSignificantCandidate->Event.Action,
+							LastSignificantCandidate->Event.ColorDeltaMax);
+					}
+				}
+				else
+				{
+					Summary = FString::Printf(TEXT("EID %u 是 P1 的最后物理写入者，并造成显著颜色变化（Δmax=%.6g）；它是当前主要写入候选，但跨 RT、材质和物体归属仍只接受显式证据。"),
+						Candidate.Event.EventId, Candidate.Event.ColorDeltaMax);
+					CausalPath += FString::Printf(TEXT("\n↓\n最后且显著写入 EID %u · %s（Δmax=%.6g）"),
+						Candidate.Event.EventId, *Candidate.Event.Action, Candidate.Event.ColorDeltaMax);
+				}
+				CausalPath += FString::Printf(TEXT("\n↓\n■ 当前反向追踪边界：%s"),
 					Semantics == TEXT("resample/nonlinear")
 						? TEXT("发生缩放/重采样，不能假定同坐标继续上溯")
-						: TEXT("只展开该事件的已用输入与 Shader 状态"));
+						: TEXT("输入资源仅按 producer 关系有界展开；像素贡献与坐标映射必须另行证明"));
 				Report += FString::Printf(
-					TEXT("\nCandidate interval\n- EID %u [%s / %s] %s\n- result: %s\n"),
+					TEXT("\nFinal writer\n- EID %u [%s / %s] %s\n- result: %s\n- color change: %s；deltaMax=%.9g；deltaL1=%.9g\n"),
 					Candidate.Event.EventId, *Candidate.Event.ActionKind, *Semantics, *Candidate.Event.Action,
-					*DescribeEventResult(Candidate.Event));
+					*DescribeEventResult(Candidate.Event), *ClassifyColorDelta(Candidate.Event),
+					Candidate.Event.ColorDeltaMax, Candidate.Event.ColorDeltaL1);
+				if (LastSignificantCandidate.IsSet())
+				{
+					const FEventEvidence& Significant = LastSignificantCandidate->Event;
+					Report += FString::Printf(TEXT("\nSignificant upstream writer candidate\n- EID %u [%s / %s] %s\n- color change: %s；deltaMax=%.9g；deltaL1=%.9g\n"),
+						Significant.EventId, *Significant.ActionKind, *ClassifySemantics(Significant), *Significant.Action,
+						*ClassifyColorDelta(Significant), Significant.ColorDeltaMax, Significant.ColorDeltaL1);
+				}
 
 				for (const FString& Failure : Candidate.Event.FailureReasons)
 				{
@@ -5000,9 +4354,9 @@ namespace UE::RenderTrail::Private
 							break;
 						}
 						Report += Input.bTexture
-							? FString::Printf(TEXT("- Input: %s [%s, %s] %dx%d\n"),
-								*Input.Name, *Input.Stage, *Input.Access, Input.Width, Input.Height)
-							: FString::Printf(TEXT("- Input: %s [%s, %s] buffer/resource\n"),
+							? FString::Printf(TEXT("- Bound input candidate: %s [%s, %s] %s %dx%d；像素贡献尚未由绑定本身证明\n"),
+								*Input.Name, *Input.Stage, *Input.Access, *Input.Format, Input.Width, Input.Height)
+							: FString::Printf(TEXT("- Bound input candidate: %s [%s, %s] buffer/resource；像素贡献尚未证明\n"),
 								*Input.Name, *Input.Stage, *Input.Access);
 					}
 					int32 ShownOutputs = 0;
@@ -5028,19 +4382,41 @@ namespace UE::RenderTrail::Private
 						FString ResourceName;
 						FString ProducerAction;
 						FString ProducerKind;
+						FString ProducerStatus;
+						FString ProducerUsage;
 						FString CoordinateMapping;
+						FString PixelTraceStatus;
+						FString ChainBreak;
 						bool bProducerFound = false;
 						double ProducerEventId = 0.0;
+						double InvalidatingEventId = 0.0;
 						Provenance->TryGetStringField(TEXT("resource"), ResourceName);
 						Provenance->TryGetStringField(TEXT("producerAction"), ProducerAction);
 						Provenance->TryGetStringField(TEXT("producerKind"), ProducerKind);
+						Provenance->TryGetStringField(TEXT("producerStatus"), ProducerStatus);
+						Provenance->TryGetStringField(TEXT("producerUsage"), ProducerUsage);
 						Provenance->TryGetStringField(TEXT("coordinateMapping"), CoordinateMapping);
+						Provenance->TryGetStringField(TEXT("pixelTraceStatus"), PixelTraceStatus);
+						Provenance->TryGetStringField(TEXT("chainBreak"), ChainBreak);
 						Provenance->TryGetBoolField(TEXT("producerFound"), bProducerFound);
 						Provenance->TryGetNumberField(TEXT("producerEventId"), ProducerEventId);
-						Report += bProducerFound
-							? FString::Printf(TEXT("- Input producer: %s ← EID %u [%s] %s；%s\n"), *ResourceName,
-								static_cast<uint32>(ProducerEventId), *ProducerKind, *ProducerAction, *CoordinateMapping)
-							: FString::Printf(TEXT("- Input producer: %s ← 未找到此前写入事件；%s\n"), *ResourceName, *CoordinateMapping);
+						Provenance->TryGetNumberField(TEXT("invalidatingEventId"), InvalidatingEventId);
+						if (ProducerStatus == TEXT("invalidated"))
+						{
+							Report += FString::Printf(TEXT("- Resource chain break: %s 在 EID %u 被 Discard；Discard 不是 producer。%s\n"),
+								*ResourceName, static_cast<uint32>(InvalidatingEventId), ChainBreak.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" %s"), *ChainBreak));
+						}
+						else if (bProducerFound)
+						{
+							Report += FString::Printf(TEXT("- Resource producer edge: %s ← EID %u [%s/%s] %s；%s；pixel trace=%s；该资源关系不自动证明像素贡献\n"), *ResourceName,
+								static_cast<uint32>(ProducerEventId), *ProducerKind, *ProducerUsage, *ProducerAction, *CoordinateMapping,
+								PixelTraceStatus.IsEmpty() ? TEXT("unknown") : *PixelTraceStatus);
+						}
+						else
+						{
+							Report += FString::Printf(TEXT("- Resource chain break: %s ← 未找到此前有效写入；%s；%s\n"),
+								*ResourceName, *CoordinateMapping, *ChainBreak);
+						}
 					}
 
 					Report += TEXT("\nPipeline 固定功能状态\n");
@@ -5110,10 +4486,11 @@ namespace UE::RenderTrail::Private
 					for (int32 EventIndex = Events->Num() - 1; EventIndex >= First; --EventIndex)
 					{
 						const FEventEvidence& Event = (*Events)[EventIndex];
-						Report += FString::Printf(TEXT("%d. EID %u [%s] %s\n   marker/pass: %s\n   semantic: %s | flags=%u | result: %s\n   pixel: before=%s | shaderOutput=%s | after=%s\n"),
+						Report += FString::Printf(TEXT("%d. EID %u [%s] %s\n   marker/pass: %s\n   semantic: %s | flags=%u | result: %s\n   pixel: before=%s | shaderOutput=%s | after=%s\n   change: %s | deltaMax=%.9g | deltaL1=%.9g\n"),
 							++Hop, Event.EventId, *Event.ActionKind, *Event.Action,
 							*CompactMarkerPath(Event.MarkerPath), *ClassifySemantics(Event), Event.ActionFlags, *DescribeEventResult(Event),
-							*Event.Before, *Event.ShaderOutput, *Event.After);
+							*Event.Before, *Event.ShaderOutput, *Event.After,
+							*ClassifyColorDelta(Event), Event.ColorDeltaMax, Event.ColorDeltaL1);
 						if (const FEventContextEvidence* Context = EventContexts.Find(Event.EventId))
 						{
 							Report += FString::Printf(TEXT("   context: shader=%s%s; inputs=%d; outputs=%d; fixedFunction=%s; debugTrace=%s\n"),
@@ -5124,6 +4501,35 @@ namespace UE::RenderTrail::Private
 								Context->ShaderDebugTrace.IsValid() ? TEXT("available") : TEXT("not-run"));
 						}
 					}
+				}
+			}
+
+			TArray<uint32> RecursiveContextIds;
+			for (const TPair<uint32, FEventContextEvidence>& Pair : EventContexts)
+			{
+				if (EventContextDepths.FindRef(Pair.Key) > 0)
+				{
+					RecursiveContextIds.Add(Pair.Key);
+				}
+			}
+			RecursiveContextIds.Sort([this](uint32 A, uint32 B)
+			{
+				const int32 DepthA = EventContextDepths.FindRef(A);
+				const int32 DepthB = EventContextDepths.FindRef(B);
+				return DepthA == DepthB ? A > B : DepthA < DepthB;
+			});
+			if (!RecursiveContextIds.IsEmpty())
+			{
+				Report += TEXT("\nRecursive resource-producer frontier (resource relation confirmed; P1 contribution/coordinate may remain unproven)\n");
+				for (int32 Index = 0; Index < RecursiveContextIds.Num() && Index < MaxInitialEventContexts; ++Index)
+				{
+					const uint32 EventId = RecursiveContextIds[Index];
+					const FEventContextEvidence& Context = EventContexts.FindChecked(EventId);
+					Report += FString::Printf(TEXT("- depth=%d EID %u [%s] %s\n  marker/pass: %s\n  shader: %s%s；inputs=%d；outputs=%d；pipeline=%s\n"),
+						EventContextDepths.FindRef(EventId), EventId, *Context.ActionKind, *Context.Action,
+						*CompactMarkerPath(Context.MarkerPath), *Context.ShaderStage,
+						Context.ShaderEntry.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("/%s"), *Context.ShaderEntry),
+						Context.Inputs.Num(), Context.Outputs.Num(), Context.PipelineState.IsValid() ? TEXT("available") : TEXT("unavailable"));
 				}
 			}
 
@@ -5150,12 +4556,14 @@ namespace UE::RenderTrail::Private
 		TArray<FPixelSample> Samples;
 		TMap<FString, uint64> PendingSampleByRequest;
 		TMap<uint32, FEventContextEvidence> EventContexts;
+		TMap<uint32, int32> EventContextDepths;
 		TMap<FString, uint32> PendingEventContextByRequest;
 		TMap<FString, uint32> PendingShaderDebugByRequest;
 		TSet<uint32> PendingEventContextIds;
 		TSet<uint32> FailedEventContextIds;
 		TSet<uint32> FailedShaderDebugIds;
 		TOptional<FCausalCandidate> LastCandidate;
+		TOptional<FCausalCandidate> LastSignificantCandidate;
 		FString LastReportSummary;
 		FString LastReportCausalPath;
 		FString AgentBrokerUrl;

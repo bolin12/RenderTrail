@@ -1,4 +1,5 @@
 #include "RenderTrailProtocol.h"
+#include "RenderTrailReplayEvidence.h"
 
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
@@ -914,14 +915,18 @@ namespace UE::RenderTrail::Private
 			{
 				const TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 				FString Name;
-				for (const ResourceDescription& Resource : Resources)
+				int32 ResourceIndex = INDEX_NONE;
+				for (int32 Index = 0; Index < static_cast<int32>(Resources.size()); ++Index)
 				{
+					const ResourceDescription& Resource = Resources[Index];
 					if (Resource.resourceId == Id)
 					{
 						Name = FromRdcString(Resource.name);
+						ResourceIndex = Index;
 						break;
 					}
 				}
+				Item->SetNumberField(TEXT("resourceIndex"), ResourceIndex);
 				Item->SetStringField(TEXT("name"), Name.IsEmpty() ? TEXT("Unnamed resource") : Name);
 				Item->SetStringField(TEXT("stage"), StageText);
 				Item->SetStringField(TEXT("access"), Access);
@@ -931,6 +936,7 @@ namespace UE::RenderTrail::Private
 					if (Texture.resourceId == Id)
 					{
 						bTexture = true;
+						Item->SetStringField(TEXT("format"), FromRdcString(Texture.format.Name()));
 						Item->SetNumberField(TEXT("width"), Texture.width);
 						Item->SetNumberField(TEXT("height"), Texture.height);
 						Item->SetNumberField(TEXT("depth"), Texture.depth);
@@ -975,14 +981,12 @@ namespace UE::RenderTrail::Private
 			TArray<const ActionDescription*> FlatActions;
 			FlattenActions(Controller->GetRootActions(), FlatActions);
 			const ActionDescription* SelectedAction = nullptr;
-			int32 SelectedActionIndex = INDEX_NONE;
 			for (int32 ActionIndex = 0; ActionIndex < FlatActions.Num(); ++ActionIndex)
 			{
 				const ActionDescription* Action = FlatActions[ActionIndex];
 				if (Action && Action->eventId == EventId)
 				{
 					SelectedAction = Action;
-					SelectedActionIndex = ActionIndex;
 					break;
 				}
 			}
@@ -1007,51 +1011,43 @@ namespace UE::RenderTrail::Private
 			TArray<TSharedPtr<FJsonValue>> ResourceProvenance;
 			for (const ResourceId& InputResource : SeenInputs)
 			{
-				const TSharedRef<FJsonObject> Provenance = MakeShared<FJsonObject>();
 				FString ResourceName;
-				for (const ResourceDescription& Resource : Resources)
+				int32 ResourceIndex = INDEX_NONE;
+				for (int32 Index = 0; Index < static_cast<int32>(Resources.size()); ++Index)
 				{
+					const ResourceDescription& Resource = Resources[Index];
 					if (Resource.resourceId == InputResource)
 					{
 						ResourceName = FromRdcString(Resource.name);
+						ResourceIndex = Index;
 						break;
 					}
 				}
-				Provenance->SetStringField(TEXT("resource"), ResourceName.IsEmpty() ? TEXT("Unnamed resource") : ResourceName);
-				Provenance->SetStringField(TEXT("coordinateMapping"), TEXT("not-proven; same resource does not imply same pixel coordinate"));
-				bool bFoundProducer = false;
-				if (SelectedActionIndex != INDEX_NONE)
+
+				const TextureDescription* InputTexture = nullptr;
+				const TextureDescription* OutputTexture = nullptr;
+				for (const TextureDescription& Texture : Textures)
 				{
-					for (int32 ProducerIndex = SelectedActionIndex - 1; ProducerIndex >= 0; --ProducerIndex)
+					if (Texture.resourceId == InputResource)
 					{
-						const ActionDescription* Producer = FlatActions[ProducerIndex];
-						if (!Producer)
+						InputTexture = &Texture;
+					}
+					if (SelectedAction)
+					{
+						for (const ResourceId& OutputResource : SelectedAction->outputs)
 						{
-							continue;
-						}
-						bool bProducesResource = false;
-						for (const ResourceId& Output : Producer->outputs)
-						{
-							if (Output == InputResource)
+							if (Texture.resourceId == OutputResource)
 							{
-								bProducesResource = true;
+								OutputTexture = &Texture;
 								break;
 							}
 						}
-						if (!bProducesResource)
-						{
-							continue;
-						}
-						Provenance->SetNumberField(TEXT("producerEventId"), Producer->eventId);
-						Provenance->SetStringField(TEXT("producerAction"), ActionNames.FindRef(Producer->eventId));
-						Provenance->SetStringField(TEXT("producerKind"), ActionKinds.FindRef(Producer->eventId));
-						Provenance->SetStringField(TEXT("producerMarkerPath"), ActionPaths.FindRef(Producer->eventId));
-						bFoundProducer = true;
-						break;
 					}
 				}
-				Provenance->SetBoolField(TEXT("producerFound"), bFoundProducer);
-				ResourceProvenance.Add(MakeShared<FJsonValueObject>(Provenance));
+
+				ResourceProvenance.Add(MakeShared<FJsonValueObject>(BuildResourceProvenance(
+					*Controller, InputResource, EventId, ResourceName, ResourceIndex, InputTexture, OutputTexture,
+					ActionNames, ActionKinds, ActionPaths)));
 			}
 
 			bool bShaderDebuggable = false;
@@ -1170,6 +1166,20 @@ namespace UE::RenderTrail::Private
 			}
 
 			Controller->SetFrameEvent(EventId, true);
+			const ShaderReflection* DebugShader = nullptr;
+			ResourceId DebugPipeline;
+			if (const D3D12Pipe::State* D3D12State = Controller->GetD3D12PipelineState())
+			{
+				DebugShader = D3D12State->pixelShader.reflection;
+				DebugPipeline = D3D12State->pipelineResourceId;
+			}
+			else if (const D3D11Pipe::State* D3D11State = Controller->GetD3D11PipelineState())
+			{
+				DebugShader = D3D11State->pixelShader.reflection;
+			}
+			const FString ShaderDisassembly = DebugShader
+				? FromRdcString(Controller->DisassembleShader(DebugPipeline, DebugShader, rdcstr()))
+				: FString();
 			DebugPixelInputs Inputs;
 			if (bHasPrimitive)
 			{
@@ -1377,6 +1387,12 @@ namespace UE::RenderTrail::Private
 
 			TArray<TSharedPtr<FJsonValue>> StepFlags;
 			TArray<TSharedPtr<FJsonValue>> TraceStateSamples;
+			TArray<FIntPoint> ObservedInstructionLines;
+			TMap<uint32, int32> DisassemblyLineByInstruction;
+			for (const InstructionSourceInfo& Info : Trace->instInfo)
+			{
+				DisassemblyLineByInstruction.Add(Info.instruction, static_cast<int32>(Info.lineInfo.disassemblyLine));
+			}
 			TSharedPtr<FJsonObject> FirstStateSnapshot;
 			TSharedPtr<FJsonObject> LastStateSnapshot;
 			int32 StepCount = 0;
@@ -1395,6 +1411,11 @@ namespace UE::RenderTrail::Private
 					for (const ShaderDebugState& State : States)
 					{
 						++StepCount;
+						if (const int32* DisassemblyLine = DisassemblyLineByInstruction.Find(State.nextInstruction))
+						{
+							ObservedInstructionLines.AddUnique(FIntPoint(
+								static_cast<int32>(State.nextInstruction), *DisassemblyLine));
+						}
 						TotalVariableChanges += static_cast<int32>(State.changes.size());
 						MaxCallstackDepth = FMath::Max(MaxCallstackDepth, static_cast<int32>(State.callstack.size()));
 						LastStateSnapshot = SerializeStateSnapshot(State);
@@ -1442,6 +1463,8 @@ namespace UE::RenderTrail::Private
 			}
 			Object->SetArrayField(TEXT("traceStateSamples"), MoveTemp(TraceStateSamples));
 			Object->SetArrayField(TEXT("stepFlags"), MoveTemp(StepFlags));
+			Object->SetObjectField(TEXT("shaderCodeEvidence"),
+				BuildShaderCodeEvidence(ShaderDisassembly, ObservedInstructionLines));
 			Controller->FreeTrace(Trace);
 			Emit(Object);
 			if (FinalEventId > 0)

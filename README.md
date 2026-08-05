@@ -5,6 +5,8 @@ RenderTrail 是一个仅用于编辑器的 UE 插件。截帧、界面和模型�
 - `RenderTrailAnalyzerEditor`：编辑器内的 Nomad 标签页，包含预览、像素选择、因果卡片和 Agent 流程。
 - `RenderTrailReplayWorker`：由插件拥有的 UBT Program 模块，包含 RenderDoc Replay API 适配器。编辑器通过管道启动生成的 `RenderTrailReplayWorker.exe`，自身不会链接或调用 Replay API。
 
+Analyzer 内部进一步按职责拆分：`RenderTrailAnalyzerImageView` 负责像素预览与选择，`RenderTrailAnalyzerEvidence` 负责 Pixel History 数值化、事件聚合和因果图，`RenderTrailAnalyzerPrompt` 负责可覆盖 Prompt 的加载；Replay Worker 的资源生产者、Discard 和跨资源边界判定位于 `RenderTrailReplayEvidence`。主模块只保留 UI 编排、Worker 调度和报告状态。
+
 按照常规方式在项目或引擎中启用插件，然后编译普通 Editor Target。Level Editor 顶部工具栏的 Play 区域会显示一个 **RenderTrail** 图标，与 **Open Neural Rendering Lab** 位于同一区域。点击后，插件会优先恢复上一次编辑器运行遗留的、已经完成但尚未认领的 `.rdc`；如果没有可恢复文件，则按照 Epic 的 Alt+F12 截帧流程执行，但会显式传入当前聚焦的 Game Viewport 或活动 Level Editor Viewport 的原生窗口句柄。在 PIE 运行期间，即使点击工具栏暂时改变了 Slate 焦点，插件仍会保留 Game Viewport 作为截帧目标。插件等待文件大小稳定后写入 UE 上下文，然后在 Unreal Editor 中打开 RenderTrail Analyzer 标签页。
 
 RenderDoc 截帧要求 Epic 的 `RenderDocPlugin` 已附加，并且当前 RHI 受支持。若只截取目标 Viewport，请关闭 **Project Settings > Plugins > RenderDoc > Capture all activity**；开启该选项会有意包含 Slate、所有 Viewport 以及编辑器窗口活动。如果一次截帧包含多个 Present/SwapBuffer 输出，Replay Worker 会选择有证据支持的最大输出，避免误选较小的通知窗口。
@@ -27,7 +29,11 @@ SDK 可以由插件、宿主项目、Engine 或 `RENDERTRAIL_RENDERDOC_ROOT` 环
 
 为控制载荷大小，每个选中像素仅保留最新 256 条详细 Pixel History modification；但 Replay 模块还会针对完整 Pixel History 输出逐事件汇总 `eventSummaries`。如果该汇总缺失或不完整，Analyzer 会停止，而不会根据被截断的尾部证据生成因果结论。
 
-确定性分析层会自动收集当前像素最多 24 个相关事件的 Pipeline、Shader 和资源上下文，优先收集已确认的写入者，其次是被拒绝的尝试；这些上下文不是由 Agent 选择的。每次分析只处理一个像素，不执行跨点共同链或分叉归纳。输入与输出尺寸不一致时，精确的同坐标祖先追踪会停止，不会虚构连接。
+确定性分析层会自动收集当前像素最多 24 个相关事件的 Pipeline、Shader 和资源上下文，优先收集最终 RT 上最多 10 个已确认写入者，并为每个事件最多展开 3 个有资源写入证据的 producer，反向深度最多 10 跳；这些上下文不是由 Agent 选择的。每次分析只处理一个像素，不执行跨点共同链或分叉归纳。输入与输出尺寸不一致时，精确的同坐标祖先追踪会停止，不会虚构连接。
+
+报告会明确区分最后物理写入者和显著颜色形成候选。Analyzer 将 RenderDoc 的 Before/After 数值化并计算 `colorDeltaMax`、`colorDeltaL1`；小于一个标准 8-bit 量化步长的变化只作为继续上溯的启发式条件，不作为根因证明。跨资源部分以 `causalGraph` 输出 RT/资源候选、Pass/Event、Pipeline、Shader、producer 关系、坐标映射状态和 UE 归属状态。绑定资源只算候选输入；没有实际采样坐标和值时，`pixelTraceStatus` 会保持 blocked，不会声称该输入贡献了 P1。
+
+`.rdc` 不包含现成的 UE 语义因果链。它保存 GPU 命令、资源、Pipeline、Shader 和可用 Marker，Pixel History 由 RenderDoc 回放时重建。RT 写入和资源使用通常可以推导；但精确采样坐标、材质、Mesh 或 Actor 在没有 Shader 调试、源码映射、ShaderMap 或 UE Marker 时可能不可恢复，此时 RenderTrail 会保留 `unknown` 或显式 `chainBreak`。
 
 Analyzer 运行期间，`.rdc` 会保持在 Replay Worker 会话中打开，因此每次像素查询都会复用同一个 Replay 会话。Worker 提供 Pixel History、完整事件汇总和确定性的有界事件上下文前沿。对于选中的末端写入者，如果 Replay 支持，Analyzer 还会自动请求 `DebugPixel`，收集指令/源码映射数量、有界输入值和常量值、执行状态样本、变量变化值、调用栈深度及执行标志。这些信息可以证明该点实际执行了什么，但不会假装总能从调试轨迹中恢复高层材质公式。
 
@@ -74,6 +80,14 @@ Agent System Prompt 已外置到标准 Unreal 风格的 INI 文件 `Plugins/Rend
 截帧命令不会启动任何模型服务。如果配置的 RenderTrail Endpoint 不可用，只有紫色语义整理阶段会失败；预览、Pixel History 和确定性因果卡片仍可继续使用。
 
 ## 开发日志
+
+### 2026-08-05 — 像素因果图与证据模块化
+
+- 将 Analyzer 的像素视图、证据模型/因果图和 Prompt 加载拆成独立模块；将 Worker 的资源生产者和生命周期判定拆到独立 Replay 取证模块。
+- 区分 `finalWriter` 与 `significantWriterCandidate`，数值化 Before/After 并输出颜色差值；末端微调不会再被自动描述为主要形成原因。
+- 新增有界 `causalGraph`：包含最终 RT 像素写入跳转、资源 producer 边、坐标映射状态、Shader/Pipeline 摘要、UE Material/Mesh/Actor 归属状态和链条断点。
+- producer 判定改用 RenderDoc `GetUsage`；`Discard` 现在明确表示资源失效和因果链断点，不再被错误当作颜色生产者。
+- `DebugPixel` 的已执行指令现在映射到有界反汇编窗口；它能作为实际执行证据，但没有源码映射时仍不等同于 UE 材质公式。
 
 ### 2026-08-05 — 单像素分析与完整诊断修复
 
