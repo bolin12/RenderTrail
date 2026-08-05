@@ -20,11 +20,11 @@ RenderDoc Replay 运行在插件拥有的独立 Worker 进程中；编辑器负�
 ## 快速开始
 
 1. 在项目中启用 `RenderTrail` 和 Epic `RenderDocPlugin`，构建项目的 Editor Target 与 `RenderTrailReplayWorker`。
-2. 在 Level Editor 顶部工具栏点击 **RenderTrail**；插件会恢复最近的完整截帧，或截取下一帧。
-3. 等待预览载入，点击画面选择 `P1`，再点击 **分析当前像素**。
+2. 在 Level Editor 顶部工具栏点击 **RenderTrail**；插件会恢复最近的完整截帧，或截取下一帧，并先显示原生尺寸预览。
+3. 点击画面选择 `P1`，再点击 **分析当前像素**；完整 Replay 此时才会按需启动。
 4. 在右侧查看结构化结论和技术证据；需要语义整理时，在底部向 Agent 提问。
 
-`.rdc` 保存在 `Saved/RenderDocCaptures`。RenderTrail 只在旁边维护较小的 `.rendertrail.json` 上下文文件，不复制原始截帧。
+`.rdc` 保存在 `Saved/RenderDocCaptures`。RenderTrail 只维护较小的 `.rendertrail.json` 上下文和 `Saved/Previews` 原生预览，不复制原始截帧。
 
 ## 文档
 

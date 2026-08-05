@@ -432,7 +432,7 @@ namespace UE::RenderTrail::Private
 			const TCHAR* RequiredExports[] = {
 				TEXT("RENDERDOC_AllocArrayMem"), TEXT("RENDERDOC_FreeArrayMem"), TEXT("RENDERDOC_GetVersionString"),
 				TEXT("RENDERDOC_GetCommitHash"), TEXT("RENDERDOC_InitialiseReplay"), TEXT("RENDERDOC_OpenCaptureFile"),
-				TEXT("RENDERDOC_ShutdownReplay")};
+				TEXT("RENDERDOC_ResourceFormatName"), TEXT("RENDERDOC_ShutdownReplay")};
 			for (const TCHAR* Export : RequiredExports)
 			{
 				if (!FPlatformProcess::GetDllExport(DllHandle, Export))
@@ -441,6 +441,8 @@ namespace UE::RenderTrail::Private
 					return false;
 				}
 			}
+			ResourceFormatName = reinterpret_cast<FResourceFormatName>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_ResourceFormatName")));
 
 			RenderDocVersion = UTF8_TO_TCHAR(RENDERDOC_GetVersionString());
 			RenderDocCommit = UTF8_TO_TCHAR(RENDERDOC_GetCommitHash());
@@ -470,30 +472,38 @@ namespace UE::RenderTrail::Private
 			}
 			Report(TEXT("RDC container opened"));
 
-			// RenderDoc stores a final-frame thumbnail in the capture container. It can
-			// be decoded immediately after OpenFile(), while OpenCapture() below may
-			// spend tens of seconds creating the replay controller. Publish this as a
-			// provisional preview so the editor can become interactive immediately.
-			const Thumbnail EmbeddedThumbnail = File->GetThumbnail(FileType::PNG, 8192);
-			if (!EmbeddedThumbnail.data.empty() && EmbeddedThumbnail.width > 0 && EmbeddedThumbnail.height > 0)
+			// A native-size preview captured by the editor is pixel-addressable and must
+			// not be overwritten by RenderDoc's window thumbnail while Replay is opening.
+			// Legacy/external captures without that cache still get the embedded thumbnail
+			// as a provisional, non-authoritative preview.
+			if (IsPixelExactPreviewValid())
 			{
-				TArray64<uint8> ThumbnailBytes;
-				ThumbnailBytes.SetNumUninitialized(static_cast<int64>(EmbeddedThumbnail.data.size()));
-				FMemory::Memcpy(ThumbnailBytes.GetData(), EmbeddedThumbnail.data.data(), EmbeddedThumbnail.data.size());
-				IFileManager::Get().MakeDirectory(*FPaths::GetPath(PreviewPath), true);
-				if (FFileHelper::SaveArrayToFile(ThumbnailBytes, *PreviewPath))
+				bPreviewCached = true;
+				Report(TEXT("Preserving cached native preview while Replay opens"));
+			}
+			else
+			{
+				const Thumbnail EmbeddedThumbnail = File->GetThumbnail(FileType::PNG, 8192);
+				if (!EmbeddedThumbnail.data.empty() && EmbeddedThumbnail.width > 0 && EmbeddedThumbnail.height > 0)
 				{
-					bEmbeddedThumbnailExported = true;
-					Report(FString::Printf(TEXT("Fast capture thumbnail exported: %ux%u"),
-						EmbeddedThumbnail.width, EmbeddedThumbnail.height));
+					TArray64<uint8> ThumbnailBytes;
+					ThumbnailBytes.SetNumUninitialized(static_cast<int64>(EmbeddedThumbnail.data.size()));
+					FMemory::Memcpy(ThumbnailBytes.GetData(), EmbeddedThumbnail.data.data(), EmbeddedThumbnail.data.size());
+					IFileManager::Get().MakeDirectory(*FPaths::GetPath(PreviewPath), true);
+					if (FFileHelper::SaveArrayToFile(ThumbnailBytes, *PreviewPath))
+					{
+						bEmbeddedThumbnailExported = true;
+						Report(FString::Printf(TEXT("Fast capture thumbnail exported: %ux%u"),
+							EmbeddedThumbnail.width, EmbeddedThumbnail.height));
 
-					const TSharedRef<FJsonObject> PreviewObject = MakeShared<FJsonObject>();
-					PreviewObject->SetStringField(TEXT("type"), TEXT("preview"));
-					PreviewObject->SetStringField(TEXT("previewPath"), PreviewPath);
-					PreviewObject->SetNumberField(TEXT("width"), EmbeddedThumbnail.width);
-					PreviewObject->SetNumberField(TEXT("height"), EmbeddedThumbnail.height);
-					PreviewObject->SetStringField(TEXT("source"), TEXT("embedded_capture_thumbnail"));
-					Emit(PreviewObject);
+						const TSharedRef<FJsonObject> PreviewObject = MakeShared<FJsonObject>();
+						PreviewObject->SetStringField(TEXT("type"), TEXT("preview"));
+						PreviewObject->SetStringField(TEXT("previewPath"), PreviewPath);
+						PreviewObject->SetNumberField(TEXT("width"), EmbeddedThumbnail.width);
+						PreviewObject->SetNumberField(TEXT("height"), EmbeddedThumbnail.height);
+						PreviewObject->SetStringField(TEXT("source"), TEXT("embedded_capture_thumbnail"));
+						Emit(PreviewObject);
+					}
 				}
 			}
 
@@ -697,11 +707,10 @@ namespace UE::RenderTrail::Private
 			Report(FString::Printf(TEXT("Target texture identified: %s %ux%u; action labels deferred"),
 				TargetName.IsEmpty() ? TEXT("<unnamed>") : *TargetName, Width, Height));
 
-			if (!bEmbeddedThumbnailExported && IsPreviewCacheValid())
+			if (!bEmbeddedThumbnailExported && IsPixelExactPreviewValid())
 			{
 				bPreviewCached = true;
-				Report(TEXT("Reused cached preview"));
-				return true;
+				Report(TEXT("Native preview remained available during Replay initialisation"));
 			}
 
 			if (FinalEventId > 0)
@@ -721,6 +730,7 @@ namespace UE::RenderTrail::Private
 				OutError = FString::Printf(TEXT("Could not export preview: %s"), *ResultMessage(SaveResult));
 				return false;
 			}
+			bPreviewCached = false;
 			Report(TEXT("Preview exported"));
 			return true;
 		}
@@ -911,7 +921,7 @@ namespace UE::RenderTrail::Private
 			const rdcarray<ResourceDescription>& Resources = Controller->GetResources();
 			const rdcarray<TextureDescription>& Textures = Controller->GetTextures();
 
-			auto ResourceToJson = [&Resources, &Textures](ResourceId Id, const FString& StageText, const FString& Access)
+			auto ResourceToJson = [this, &Resources, &Textures](ResourceId Id, const FString& StageText, const FString& Access)
 			{
 				const TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 				FString Name;
@@ -936,7 +946,13 @@ namespace UE::RenderTrail::Private
 					if (Texture.resourceId == Id)
 					{
 						bTexture = true;
-						Item->SetStringField(TEXT("format"), FromRdcString(Texture.format.Name()));
+						rdcstr FormatName;
+						if (ResourceFormatName)
+						{
+							ResourceFormatName(Texture.format, FormatName);
+						}
+						Item->SetStringField(TEXT("format"),
+							FormatName.empty() ? TEXT("unknown") : FromRdcString(FormatName));
 						Item->SetNumberField(TEXT("width"), Texture.width);
 						Item->SetNumberField(TEXT("height"), Texture.height);
 						Item->SetNumberField(TEXT("depth"), Texture.depth);
@@ -1528,6 +1544,8 @@ namespace UE::RenderTrail::Private
 		}
 
 	private:
+		using FResourceFormatName = void (RENDERDOC_CC *)(const ResourceFormat&, rdcstr&);
+
 		bool IsPreviewCacheValid() const
 		{
 			if (!IFileManager::Get().FileExists(*PreviewPath))
@@ -1541,6 +1559,26 @@ namespace UE::RenderTrail::Private
 				return false;
 			}
 			return PreviewTimestamp >= CaptureTimestamp;
+		}
+
+		bool IsPixelExactPreviewValid() const
+		{
+			if (!IsPreviewCacheValid())
+			{
+				return false;
+			}
+			FString MetadataJson;
+			FCaptureMetadata Metadata;
+			FString MetadataError;
+			return FFileHelper::LoadFileToString(
+					MetadataJson, *GetMetadataPathForCapture(CapturePath))
+				&& FCaptureMetadata::FromJson(MetadataJson, Metadata, MetadataError)
+				&& Metadata.bPreviewPixelExact
+				&& Metadata.PreviewWidth > 0
+				&& Metadata.PreviewHeight > 0
+				&& !Metadata.PreviewPath.IsEmpty()
+				&& FPaths::IsSamePath(
+					FPaths::ConvertRelativePathToFull(Metadata.PreviewPath), PreviewPath);
 		}
 
 		bool EnsureActionIndex(FString& OutError)
@@ -1566,6 +1604,7 @@ namespace UE::RenderTrail::Private
 		}
 
 		void* DllHandle = nullptr;
+		FResourceFormatName ResourceFormatName = nullptr;
 		IReplayController* Controller = nullptr;
 		bool bReplayInitialized = false;
 		bool bPixelHistorySupported = false;

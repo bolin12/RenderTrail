@@ -9,24 +9,24 @@ RenderTrail 是一个仅用于编辑器的 UE 插件。截帧、界面和模型�
 
 Analyzer 内部按职责拆分：`RenderTrailAnalyzerEditorModule` 只负责模块生命周期、Nomad 标签页注册和 `OpenCapture` 转发；`RenderTrailAnalyzerHome` 负责编辑器面板状态及分析工作流编排；`RenderTrailAnalyzerImageView` 负责像素预览与选择；`RenderTrailAnalyzerResultView` 负责结构化结论、颜色、Pass/Pipeline/Shader 和证据链展示；`RenderTrailAnalyzerEvidence` 负责 Pixel History 数值化、事件聚合和因果图；`RenderTrailEvidenceFormatting` 将 Pipeline 与 Shader 调试 JSON 转成可读证据，但不补写缺失语义；`RenderTrailReplayWorkerClient` 独占 Worker 进程、管道和退出状态；`RenderTrailAgentClient` 独占模型 HTTP 请求生命周期和兼容响应解析；`RenderTrailAgentProtocol` 负责结构化 Action JSON 的严格解析与有界修复；`RenderTrailAnalyzerDiagnostics` 负责配置、会话日志和脱敏后的 Agent 诊断；`RenderTrailAnalyzerPrompt` 负责可覆盖 Prompt 的加载。Replay Worker 内部的资源生产者、Discard 和跨资源边界判定位于 `RenderTrailReplayEvidence`。
 
-按照常规方式在项目或引擎中启用插件，然后编译普通 Editor Target。Level Editor 顶部工具栏的 Play 区域会显示一个 **RenderTrail** 图标，与 **Open Neural Rendering Lab** 位于同一区域。点击后，插件会优先恢复上一次编辑器运行遗留的、已经完成但尚未认领的 `.rdc`；如果没有可恢复文件，则按照 Epic 的 Alt+F12 截帧流程执行，但会显式传入当前聚焦的 Game Viewport 或活动 Level Editor Viewport 的原生窗口句柄。在 PIE 运行期间，即使点击工具栏暂时改变了 Slate 焦点，插件仍会保留 Game Viewport 作为截帧目标。插件等待文件大小稳定后写入 UE 上下文，然后在 Unreal Editor 中打开 RenderTrail Analyzer 标签页。
+按照常规方式在项目或引擎中启用插件，然后编译普通 Editor Target。Level Editor 顶部工具栏的 Play 区域会显示一个 **RenderTrail** 图标，与 **Open Neural Rendering Lab** 位于同一区域。点击后，插件会优先恢复上一次编辑器运行遗留的、已经完成但尚未认领的 `.rdc`；如果没有可恢复文件，则按照 Epic 的 Alt+F12 截帧流程执行，但会显式传入当前聚焦的 Game Viewport 或活动 Level Editor Viewport 的原生窗口句柄。在 PIE 运行期间，即使点击工具栏暂时改变了 Slate 焦点，插件仍会保留 Game Viewport 作为截帧目标。插件在同一次 Viewport 绘制后读回原生尺寸画面；等待 `.rdc` 文件大小稳定后，将该画面保存为像素精确预览并写入 UE 上下文，然后在 Unreal Editor 中打开 RenderTrail Analyzer 标签页。这个步骤不创建 RenderDoc ReplayController。
 
 RenderDoc 截帧要求 Epic 的 `RenderDocPlugin` 已附加，并且当前 RHI 受支持。若只截取目标 Viewport，请关闭 **Project Settings > Plugins > RenderDoc > Capture all activity**；开启该选项会有意包含 Slate、所有 Viewport 以及编辑器窗口活动。如果一次截帧包含多个 Present/SwapBuffer 输出，Replay Worker 会选择有证据支持的最大输出，避免误选较小的通知窗口。
 
-`.rdc` 由 RenderDoc 创建在 `Saved/RenderDocCaptures` 下；RenderTrail 只在旁边新增一个 `.rendertrail.json` UE 上下文文件，不复制体积较大的截帧。旧版位于 `Saved/RenderTrail/Captures` 下的截帧仍然受支持。
+`.rdc` 由 RenderDoc 创建在 `Saved/RenderDocCaptures` 下；RenderTrail 在旁边新增 `.rendertrail.json` UE 上下文，并在 `Saved/Previews` 保存同尺寸 PNG，不复制体积较大的截帧。元数据中的 `previewPixelExact`、尺寸和路径用于区分原生 Viewport 预览与 RenderDoc 的窗口缩略图。旧版位于 `Saved/RenderTrail/Captures` 下的截帧仍然受支持。
 
 ## 插件归属与构建布局
 
-所有 Replay 实现代码和版本匹配的 RenderDoc SDK 均位于 `Plugins/RenderTrail` 下。唯一位于项目中的小型文件 `Source/Programs/RenderTrailReplayWorker.Target.cs`，只是构建隔离进程所需的标准 Unreal TargetRules 入口；插件不依赖批处理脚本、自定义暂存步骤或插件内预编译 Worker。
+所有 Replay 实现代码、Worker TargetRules 和版本匹配的 RenderDoc SDK 均位于 `Plugins/RenderTrail` 下。UBT 按插件 Target 的标准发现规则从 `Plugins/RenderTrail/Tests/RenderTrailReplayWorker.Target.cs` 构建隔离进程；插件不依赖项目级 Program 源码、批处理脚本、自定义暂存步骤或插件内预编译 Worker。
 
 SDK 可以由插件、宿主项目、Engine 或 `RENDERTRAIL_RENDERDOC_ROOT` 环境变量提供。
 
 ## 像素检查流程
 
 1. 在 UE 中点击 Level Editor 顶部工具栏的 **RenderTrail** 图标。截帧完成并稳定后，编辑器内的 Analyzer 标签页会自动打开。
-2. 等待最终目标预览出现，并确认状态显示 `Pixel History: yes`。
+2. 原生最终画面出现后即可选择像素；此时 Replay Worker 尚未启动，也不会额外占用 Replay GPU/内存资源。
 3. 使用鼠标滚轮缩放，按住鼠标中键或右键拖动平移。高倍率下，预览会从带过滤的缩略图采样切换为精确的源像素方格，叠加单像素边界，并高亮光标所在单元格，确保点击坐标没有歧义。
-4. 点击一个希望解释的像素，该点记为 `P1`，不会被预先认定为正确、正常或异常。再次点击当前像素会将其清除；点击其他位置会直接替换当前点，旧点的证据不会与新点合并。点击 **分析当前像素** 确认 P1 并读取 Pixel History；规则分析完成后，可在底部填写问题并点击 **发送**。单纯选择像素不会启动查询或调用 Agent。
+4. 点击一个希望解释的像素，该点记为 `P1`，不会被预先认定为正确、正常或异常。再次点击当前像素会将其清除；点击其他位置会直接替换当前点，旧点的证据不会与新点合并。点击 **分析当前像素** 后才启动隔离 Replay Worker；ReplayController 就绪后自动读取 P1 的 Pixel History。规则分析完成后，可在底部填写问题并点击 **发送**。单纯选择像素不会启动 Replay、查询或 Agent。
 5. 右侧检查器默认打开 **结论与链条**：先显示简短结论、Before/After 颜色块、Pass/Pipeline/Shader 摘要，再用“已证明 / 候选 / 断点”节点展示像素形成链。完整事件、资源、Shader 调试和最近 24 个可追踪跳转放在独立的 **技术证据** 页。底部 Agent 输入始终绑定当前 P1；连续追问仅保留上一次问答作为指代理解上下文。点击 **清除** 会清除当前像素和报告。
 
 为控制载荷大小，每个选中像素仅保留最新 256 条详细 Pixel History modification；但 Replay 模块还会针对完整 Pixel History 输出逐事件汇总 `eventSummaries`。如果该汇总缺失或不完整，Analyzer 会停止，而不会根据被截断的尾部证据生成因果结论。
@@ -82,6 +82,14 @@ Agent System Prompt 已外置到标准 Unreal 风格的 INI 文件 `Plugins/Rend
 截帧命令不会启动任何模型服务。如果配置的 RenderTrail Endpoint 不可用，只有紫色语义整理阶段会失败；预览、Pixel History 和确定性因果卡片仍可继续使用。
 
 ## 开发日志
+
+### 2026-08-05 — 原生预览与按需 Replay
+
+- 截帧阶段直接读回同一 Viewport 的原生尺寸画面并保存到 `Saved/Previews`；Analyzer 不再为了显示可选点画面而等待 Replay Worker 冷启动。
+- `.rendertrail.json` 新增可选的预览路径、尺寸和 `previewPixelExact` 契约；旧截帧中的 RenderDoc 内嵌窗口缩略图不会被误当作最终 RT 像素坐标。
+- Analyzer 命中像素精确预览后延迟创建 Replay；只有点击 **分析当前像素** 才启动 Worker，预览和 P1 在加载期间保持可用。
+- Worker 在完整 Replay 就绪前不会用低分辨率 RenderDoc 缩略图覆盖原生预览，完成后再输出精确目标 RT。
+- 恢复插件内 `RenderTrailReplayWorker` TargetRules，并改为可独立重建的单体后台可执行文件；它仍是插件内部故障隔离边界，不是独立 Analyzer 产品。
 
 ### 2026-08-05 — 像素因果图与证据模块化
 

@@ -1848,8 +1848,8 @@ namespace UE::RenderTrail::Private
 			{
 				Diagnostics.WriteRecord(TEXT("worker_launch"), Args);
 			}
-			SetCaptureLoadPhase(TEXT("Starting isolated Replay Worker and opening .rdc"));
-			SetEvidence(TEXT("Opening the capture in an isolated RenderDoc replay process and exporting its final image..."));
+			SetCaptureLoadPhase(TEXT("Starting isolated Replay Worker and opening full Replay"));
+			SetEvidence(TEXT("原生预览仍可选点；隔离 Replay Worker 正在按需建立完整 RenderDoc Replay。"));
 			UE_LOG(LogRenderTrailAnalyzer, Display,
 				TEXT("Starting isolated Replay Worker. Worker='%s' Capture='%s' Preview='%s'"),
 				*Worker, *Capture, *InPreviewPath);
@@ -1858,7 +1858,7 @@ namespace UE::RenderTrail::Private
 				SetStatus(Error);
 				return false;
 			}
-			SetStatus(TEXT("Loading capture 0.0s - waiting for isolated Replay Worker to open .rdc and generate preview"));
+			SetStatus(TEXT("正在按需载入完整 Replay；当前预览和选点保持可用。"));
 			return true;
 		}
 
@@ -1874,16 +1874,7 @@ namespace UE::RenderTrail::Private
 				SetStatus(TEXT("Capture file does not exist."));
 				return;
 			}
-			const FString Worker = FRenderTrailReplayWorkerClient::GetDefaultExecutablePath();
-			if (!FPaths::FileExists(Worker))
-			{
-				SetStatus(FString::Printf(TEXT("Replay Worker is missing: %s. Build the standard RenderTrailReplayWorker Program target first."), *Worker));
-				UE_LOG(LogRenderTrailAnalyzer, Error, TEXT("Replay Worker is missing: %s"), *Worker);
-				return;
-			}
-
-			PreviewPath = FPaths::ConvertRelativePathToFull(FPaths::Combine(
-				FPaths::GetPath(Capture), TEXT(".."), TEXT("Previews"), FPaths::GetBaseFilename(Capture) + TEXT(".png")));
+			PreviewPath = UE::RenderTrail::GetPreviewPathForCapture(Capture);
 			CaptureLoadStartSeconds = FPlatformTime::Seconds();
 			LastCaptureLoadStatusSeconds = CaptureLoadStartSeconds;
 			bCaptureLoading = true;
@@ -1895,29 +1886,42 @@ namespace UE::RenderTrail::Private
 			SetCaptureLoadPhase(TEXT("Closing previous replay session"));
 			StopWorker();
 			Diagnostics.BeginSession(Capture, CaptureSize);
-			ReleasePreview();
 			if (!bPreserveSelection)
 			{
+				ReleasePreview();
 				ResetSamples();
 				bQueuePixelHistoryAfterWorkerReady = false;
 			}
 			bReplayStartDeferred = false;
 			bWorkerReady = false;
-			bPreviewReadyForSelection = false;
+			bPreviewReadyForSelection = bPreserveSelection && PreviewBrush.IsValid();
 			LastWorkerError.Empty();
-			if (!bPreserveSelection && IsPreviewCacheValid(Capture, PreviewPath)
-				&& LoadPreview(PreviewPath, FIntPoint::ZeroValue))
+			FIntPoint NativePreviewSize = FIntPoint::ZeroValue;
+			if (!bPreserveSelection && TryGetPixelExactPreviewSize(Capture, PreviewPath, NativePreviewSize)
+				&& LoadPreview(PreviewPath, NativePreviewSize))
 			{
 				bPreviewReadyForSelection = true;
+				bReplayStartDeferred = true;
 				UE_LOG(LogRenderTrailAnalyzer, Display,
-					TEXT("Capture preview cache hit; starting isolated Replay Worker in the background. capture='%s' preview='%s'"),
+					TEXT("Native capture preview loaded; deferring Replay Worker until pixel analysis. capture='%s' preview='%s'"),
 					*Capture, *PreviewPath);
-				SetStatus(TEXT("预览已快速载入；完整 Replay Worker 正在后台加载。"));
+				FinishCaptureLoad(TEXT("native preview ready; replay deferred"));
+				SetStatus(TEXT("原生最终画面已就绪；现在可以选点，完整 Replay 将在点击“分析当前像素”后载入。"));
 				SetReportCards(
-					TEXT("预览已载入，完整 Replay 数据正在后台加载。"),
-					TEXT("现在可以选择像素；Pixel History 会在 Replay Worker 就绪后自动排队执行。"),
+					TEXT("原生最终画面已载入，完整 Replay 尚未启动。"),
+					TEXT("选择 P1 后点击“分析当前像素”，再按需建立 Replay 和 Pixel History。"),
 					TEXT("尚无因果证据。"),
-					TEXT("当前使用预览缓存；隔离的 RenderDoc ReplayController 正在后台建立。"));
+					TEXT("预览与捕获 Viewport 同尺寸；当前未占用额外 Replay GPU/内存资源。"));
+				return;
+			}
+
+			const FString Worker = FRenderTrailReplayWorkerClient::GetDefaultExecutablePath();
+			if (!FPaths::FileExists(Worker))
+			{
+				FinishCaptureLoad(TEXT("worker missing"));
+				SetStatus(FString::Printf(TEXT("Replay Worker is missing: %s. Build the standard RenderTrailReplayWorker Program target first."), *Worker));
+				UE_LOG(LogRenderTrailAnalyzer, Error, TEXT("Replay Worker is missing: %s"), *Worker);
+				return;
 			}
 
 			if (!LaunchWorkerProcess(Worker, Capture, PreviewPath))
@@ -1927,12 +1931,12 @@ namespace UE::RenderTrail::Private
 			}
 			else if (bPreviewReadyForSelection)
 			{
-				SetStatus(TEXT("预览已就绪；完整 Replay Worker 正在后台加载。"));
+				SetStatus(TEXT("原生预览保持可用；完整 Replay Worker 正在按需加载。"));
 				SetReportCards(
-					TEXT("预览已就绪，完整 Replay 数据正在后台加载。"),
-					TEXT("现在可以选择像素；Pixel History 会在 Replay Worker 就绪后自动排队执行。"),
+					TEXT("原生预览保持可用，完整 Replay 数据正在加载。"),
+					TEXT("已确认的 P1 会在 Replay Worker 就绪后自动执行 Pixel History。"),
 					TEXT("尚无因果证据。"),
-					TEXT("当前使用预览缓存；隔离的 RenderDoc ReplayController 正在后台建立。"));
+					TEXT("Replay 仅因本次像素分析按需启动。"));
 			}
 		}
 
@@ -2014,6 +2018,7 @@ namespace UE::RenderTrail::Private
 				FSlateApplication::Get().GetRenderer()->ReleaseDynamicResource(*PreviewBrush);
 			}
 			PreviewBrush.Reset();
+			CurrentPreviewSize = FIntPoint::ZeroValue;
 		}
 
 		static bool IsPreviewCacheValid(const FString& CapturePath, const FString& InPreviewPath)
@@ -2027,6 +2032,34 @@ namespace UE::RenderTrail::Private
 			return CaptureTimestamp != FDateTime::MinValue()
 				&& PreviewTimestamp != FDateTime::MinValue()
 				&& PreviewTimestamp >= CaptureTimestamp;
+		}
+
+		static bool TryGetPixelExactPreviewSize(
+			const FString& CapturePath, const FString& InPreviewPath, FIntPoint& OutSize)
+		{
+			OutSize = FIntPoint::ZeroValue;
+			if (!IsPreviewCacheValid(CapturePath, InPreviewPath))
+			{
+				return false;
+			}
+			FString MetadataJson;
+			UE::RenderTrail::FCaptureMetadata Metadata;
+			FString MetadataError;
+			if (!FFileHelper::LoadFileToString(
+				MetadataJson, *UE::RenderTrail::GetMetadataPathForCapture(CapturePath))
+				|| !UE::RenderTrail::FCaptureMetadata::FromJson(MetadataJson, Metadata, MetadataError)
+				|| !Metadata.bPreviewPixelExact
+				|| Metadata.PreviewWidth <= 0
+				|| Metadata.PreviewHeight <= 0
+				|| Metadata.PreviewPath.IsEmpty()
+				|| !FPaths::IsSamePath(
+					FPaths::ConvertRelativePathToFull(Metadata.PreviewPath),
+					FPaths::ConvertRelativePathToFull(InPreviewPath)))
+			{
+				return false;
+			}
+			OutSize = FIntPoint(Metadata.PreviewWidth, Metadata.PreviewHeight);
+			return true;
 		}
 
 		bool LoadPreview(const FString& Path, FIntPoint ExpectedSize)
@@ -2043,6 +2076,11 @@ namespace UE::RenderTrail::Private
 				return false;
 			}
 			Image.ChangeFormat(ERawImageFormat::BGRA8, EGammaSpace::sRGB);
+			const FIntPoint ActualSize(Image.SizeX, Image.SizeY);
+			if (ExpectedSize != FIntPoint::ZeroValue && ActualSize != ExpectedSize)
+			{
+				return false;
+			}
 			TArray<uint8> Pixels(MoveTemp(Image.RawData));
 			// Final UE render targets often carry alpha=0 even though their RGB is the intended
 			// viewport image. Standalone Slate composites that alpha, so preview as opaque RGB.
@@ -2057,9 +2095,9 @@ namespace UE::RenderTrail::Private
 				return false;
 			}
 			PreviewBrush = MakeShared<FSlateDynamicImageBrush>(ResourceName, FVector2D(Image.SizeX, Image.SizeY));
-			const FIntPoint ActualSize(Image.SizeX, Image.SizeY);
 			ImageView->SetImage(PreviewBrush, ActualSize, MoveTemp(Pixels));
-			return ActualSize == ExpectedSize || ExpectedSize == FIntPoint::ZeroValue;
+			CurrentPreviewSize = ActualSize;
+			return true;
 		}
 
 		void HandleWorkerMessage(const FString& Line)
@@ -2123,6 +2161,10 @@ namespace UE::RenderTrail::Private
 				const FString Version = Message->GetStringField(TEXT("renderDocVersion"));
 				const bool bPixelHistory = Message->GetBoolField(TEXT("pixelHistorySupported"));
 				const bool bShaderDebug = Message->GetBoolField(TEXT("shaderDebuggingSupported"));
+				const FIntPoint ReplayTargetSize(Width, Height);
+				const bool bSelectionCoordinatesChanged = !Samples.IsEmpty()
+					&& CurrentPreviewSize != FIntPoint::ZeroValue
+					&& CurrentPreviewSize != ReplayTargetSize;
 				bShaderDebuggingAvailable = bShaderDebug;
 				bool bPreviewCached = false;
 				Message->TryGetBoolField(TEXT("previewCached"), bPreviewCached);
@@ -2143,11 +2185,29 @@ namespace UE::RenderTrail::Private
 					SetStatus(FString::Printf(TEXT("Replay opened, but preview could not be loaded: %s"), *Path));
 					return;
 				}
+				if (bSelectionCoordinatesChanged)
+				{
+					bQueuePixelHistoryAfterWorkerReady = false;
+					ResetSamples();
+					UpdateSelectionText();
+				}
+				UpdateMarkers();
 				const double PreviewElapsed = FPlatformTime::Seconds() - PreviewStartSeconds;
 				UE_LOG(LogRenderTrailAnalyzer, Display, TEXT("Capture preview loaded: elapsed=%.3fs path='%s'"),
 					PreviewElapsed, *Path);
 				const double TotalLoadElapsed = bCaptureLoading ? FPlatformTime::Seconds() - CaptureLoadStartSeconds : 0.0;
 				FinishCaptureLoad(TEXT("ready"));
+				if (bSelectionCoordinatesChanged)
+				{
+					SetStatus(FString::Printf(TEXT("最终 RT 尺寸为 %dx%d，与选点预览不同；为避免分析错误像素，已清除 P1，请在精确最终 RT 上重新选择。"),
+						Width, Height));
+					SetReportCards(
+						TEXT("完整 Replay 已就绪，但原生 Viewport 预览与最终 RT 尺寸不同。"),
+						TEXT("坐标映射未被证明\n↓\n请在精确最终 RT 上重新选择 P1"),
+						TEXT("旧 P1 已清除，未执行 Pixel History。"),
+						TEXT("RenderTrail 不会按比例猜测像素祖先坐标。"));
+					return;
+				}
 				SetStatus(FString::Printf(TEXT("RenderDoc %s | %dx%d | %s | Pixel History: %s | Shader Debug: %s | 载入耗时 %.1fs"),
 					*Version, Width, Height, *Target, bPixelHistory ? TEXT("yes") : TEXT("no"), bShaderDebug ? TEXT("yes") : TEXT("no"), TotalLoadElapsed));
 				SetReportCards(
@@ -3226,6 +3286,7 @@ namespace UE::RenderTrail::Private
 		FRenderTrailAnalyzerDiagnostics Diagnostics;
 		FRenderTrailReplayWorkerClient ReplayWorker;
 		FString PreviewPath;
+		FIntPoint CurrentPreviewSize = FIntPoint::ZeroValue;
 		uint64 PreviewSerial = 0;
 		uint64 RequestSerial = 0;
 		uint64 SampleSerial = 0;

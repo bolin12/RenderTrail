@@ -15,6 +15,13 @@ namespace UE::RenderTrail
 		return FPaths::ChangeExtension(CapturePath, MetadataExtension);
 	}
 
+	FString GetPreviewPathForCapture(const FString& CapturePath)
+	{
+		return FPaths::ConvertRelativePathToFull(FPaths::Combine(
+			FPaths::GetPath(CapturePath), TEXT(".."), TEXT("Previews"),
+			FPaths::GetBaseFilename(CapturePath) + TEXT(".png")));
+	}
+
 	FString FCaptureMetadata::ToJson() const
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -25,8 +32,12 @@ namespace UE::RenderTrail
 		Root->SetStringField(TEXT("mapName"), MapName);
 		Root->SetStringField(TEXT("engineVersion"), EngineVersion);
 		Root->SetStringField(TEXT("utcTimestamp"), UtcTimestamp);
+		Root->SetStringField(TEXT("previewPath"), PreviewPath);
 		Root->SetStringField(TEXT("frameCounter"), LexToString(FrameCounter));
+		Root->SetNumberField(TEXT("previewWidth"), PreviewWidth);
+		Root->SetNumberField(TEXT("previewHeight"), PreviewHeight);
 		Root->SetBoolField(TEXT("isPIE"), bIsPIE);
+		Root->SetBoolField(TEXT("previewPixelExact"), bPreviewPixelExact);
 
 		FString Result;
 		const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Result);
@@ -57,8 +68,16 @@ namespace UE::RenderTrail
 		OutMetadata.MapName = Root->GetStringField(TEXT("mapName"));
 		OutMetadata.EngineVersion = Root->GetStringField(TEXT("engineVersion"));
 		OutMetadata.UtcTimestamp = Root->GetStringField(TEXT("utcTimestamp"));
+		Root->TryGetStringField(TEXT("previewPath"), OutMetadata.PreviewPath);
 		LexFromString(OutMetadata.FrameCounter, *Root->GetStringField(TEXT("frameCounter")));
+		double PreviewWidth = 0.0;
+		double PreviewHeight = 0.0;
+		Root->TryGetNumberField(TEXT("previewWidth"), PreviewWidth);
+		Root->TryGetNumberField(TEXT("previewHeight"), PreviewHeight);
+		OutMetadata.PreviewWidth = static_cast<int32>(PreviewWidth);
+		OutMetadata.PreviewHeight = static_cast<int32>(PreviewHeight);
 		OutMetadata.bIsPIE = Root->GetBoolField(TEXT("isPIE"));
+		Root->TryGetBoolField(TEXT("previewPixelExact"), OutMetadata.bPreviewPixelExact);
 		return true;
 	}
 

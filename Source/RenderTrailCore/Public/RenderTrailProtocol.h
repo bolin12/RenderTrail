@@ -15,8 +15,12 @@ namespace UE::RenderTrail
 		FString MapName;
 		FString EngineVersion;
 		FString UtcTimestamp;
+		FString PreviewPath;
 		uint64 FrameCounter = 0;
+		int32 PreviewWidth = 0;
+		int32 PreviewHeight = 0;
 		bool bIsPIE = false;
+		bool bPreviewPixelExact = false;
 
 		FString ToJson() const;
 		static bool FromJson(const FString& Json, FCaptureMetadata& OutMetadata, FString& OutError);
@@ -24,4 +28,5 @@ namespace UE::RenderTrail
 	};
 
 	RENDERTRAILCORE_API FString GetMetadataPathForCapture(const FString& CapturePath);
+	RENDERTRAILCORE_API FString GetPreviewPathForCapture(const FString& CapturePath);
 }

@@ -14,9 +14,11 @@
 #include "IRenderCaptureProvider.h"
 #include "Interfaces/IMainFrameModule.h"
 #include "Interfaces/IPluginManager.h"
+#include "ImageUtils.h"
 #include "Misc/App.h"
 #include "Misc/DateTime.h"
 #include "Misc/EngineVersion.h"
+#include "Misc/FileHelper.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
@@ -123,8 +125,10 @@ namespace UE::RenderTrail::Private
 		return TargetViewport;
 	}
 
-	static bool CaptureCurrentViewport(FString& OutError)
+	static bool CaptureCurrentViewport(FString& OutError, TArray<FColor>& OutPreviewPixels, FIntPoint& OutPreviewSize)
 	{
+		OutPreviewPixels.Reset();
+		OutPreviewSize = FIntPoint::ZeroValue;
 		FViewport* TargetViewport = ResolveCaptureViewport(OutError);
 		if (!TargetViewport)
 		{
@@ -219,6 +223,28 @@ namespace UE::RenderTrail::Private
 				RHICmdList.SubmitAndBlockUntilGPUIdle();
 				Api->EndFrameCapture(Device, TargetWindow);
 			});
+
+		// Read the same viewport after its captured draw. ReadPixels flushes the queued
+		// render work, so this produces a native-size, pixel-addressable preview without
+		// creating a RenderDoc ReplayController. The preview is saved only after RenderDoc
+		// has assigned the final .rdc path.
+		if (TargetSize.X > 0 && TargetSize.Y > 0 && TargetViewport->ReadPixels(OutPreviewPixels)
+			&& OutPreviewPixels.Num() == static_cast<int64>(TargetSize.X) * TargetSize.Y)
+		{
+			OutPreviewSize = TargetSize;
+			for (FColor& Pixel : OutPreviewPixels)
+			{
+				Pixel.A = 255;
+			}
+			UE_LOG(LogRenderTrailCaptureEditor, Display,
+				TEXT("Captured native viewport preview: %dx%d"), TargetSize.X, TargetSize.Y);
+		}
+		else
+		{
+			OutPreviewPixels.Reset();
+			UE_LOG(LogRenderTrailCaptureEditor, Warning,
+				TEXT("RenderDoc capture succeeded, but the native viewport preview readback failed."));
+		}
 		return true;
 #else
 		OutError = TEXT("Explicit viewport capture is currently implemented for Windows only.");
@@ -308,7 +334,10 @@ private:
 		StableCandidatePolls = 0;
 
 		FString TriggerError;
-		if (!UE::RenderTrail::Private::CaptureCurrentViewport(TriggerError))
+		PendingPreviewPixels.Reset();
+		PendingPreviewSize = FIntPoint::ZeroValue;
+		if (!UE::RenderTrail::Private::CaptureCurrentViewport(
+			TriggerError, PendingPreviewPixels, PendingPreviewSize))
 		{
 			UE_LOG(LogRenderTrailCaptureEditor, Error, TEXT("Safe RenderDoc trigger failed: %s"), *TriggerError);
 			FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TriggerError));
@@ -396,6 +425,35 @@ private:
 	void FinalizeCapture(const FString& CapturePath, UE::RenderTrail::FCaptureMetadata Metadata, bool bRecovered)
 	{
 		Metadata.CapturePath = CapturePath;
+		if (!bRecovered && !PendingPreviewPixels.IsEmpty()
+			&& PendingPreviewSize.X > 0 && PendingPreviewSize.Y > 0)
+		{
+			const FString PreviewPath = UE::RenderTrail::GetPreviewPathForCapture(CapturePath);
+			IFileManager::Get().MakeDirectory(*FPaths::GetPath(PreviewPath), true);
+			TArray64<uint8> CompressedPreview;
+			FImageUtils::PNGCompressImageArray(
+				PendingPreviewSize.X,
+				PendingPreviewSize.Y,
+				TArrayView64<const FColor>(PendingPreviewPixels.GetData(), PendingPreviewPixels.Num()),
+				CompressedPreview);
+			if (!CompressedPreview.IsEmpty() && FFileHelper::SaveArrayToFile(CompressedPreview, *PreviewPath))
+			{
+				Metadata.PreviewPath = PreviewPath;
+				Metadata.PreviewWidth = PendingPreviewSize.X;
+				Metadata.PreviewHeight = PendingPreviewSize.Y;
+				Metadata.bPreviewPixelExact = true;
+				UE_LOG(LogRenderTrailCaptureEditor, Display,
+					TEXT("Saved native viewport preview for immediate pixel selection: %s (%dx%d)"),
+					*PreviewPath, PendingPreviewSize.X, PendingPreviewSize.Y);
+			}
+			else
+			{
+				UE_LOG(LogRenderTrailCaptureEditor, Warning,
+					TEXT("Could not save native viewport preview: %s"), *PreviewPath);
+			}
+		}
+		PendingPreviewPixels.Reset();
+		PendingPreviewSize = FIntPoint::ZeroValue;
 		FString MetadataPath;
 		FString MetadataError;
 		if (!Metadata.SaveAdjacent(MetadataPath, MetadataError))
@@ -421,6 +479,8 @@ private:
 	UE::RenderTrail::Private::FRawCaptureFile BaselineCapture;
 	UE::RenderTrail::FCaptureMetadata PendingMetadata;
 	FString StableCandidatePath;
+	TArray<FColor> PendingPreviewPixels;
+	FIntPoint PendingPreviewSize = FIntPoint::ZeroValue;
 	int64 StableCandidateSize = -1;
 	int32 StableCandidatePolls = 0;
 	bool bCapturePending = false;
