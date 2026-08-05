@@ -1,0 +1,33 @@
+# Unreal Engine generated output
+/Binaries/
+/Intermediate/
+/Saved/
+/DerivedDataCache/
+
+# IDE and local workspace state
+/.vs/
+/.idea/
+*.sln
+*.slnx
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# Compiler, linker, and temporary artifacts
+*.dll
+*.exe
+*.exp
+*.ilk
+*.lib
+*.obj
+*.pdb
+*.tmp
+*.old
+*.stale-*
+*.running-old-*
+
+# Logs and operating-system metadata
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,46 @@
+{
+  "FileVersion": 3,
+  "Version": 6,
+  "VersionName": "0.4.0",
+  "FriendlyName": "RenderTrail",
+  "Description": "Editor-integrated RenderDoc capture and pixel causality analysis.",
+  "Category": "Rendering",
+  "CreatedBy": "RenderTrail Team",
+  "CanContainContent": false,
+  "IsBetaVersion": true,
+  "Installed": false,
+  "SupportedPrograms": [
+    "RenderTrailReplayWorker"
+  ],
+  "Modules": [
+    {
+      "Name": "RenderTrailCore",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "RenderTrailCaptureEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit"
+    },
+    {
+      "Name": "RenderTrailAnalyzerEditor",
+      "Type": "Editor",
+      "LoadingPhase": "PostEngineInit"
+    },
+    {
+      "Name": "RenderTrailReplayWorker",
+      "Type": "Program",
+      "LoadingPhase": "Default",
+      "ProgramAllowList": [
+        "RenderTrailReplayWorker"
+      ]
+    }
+  ],
+  "Plugins": [
+    {
+      "Name": "RenderDocPlugin",
+      "Enabled": true
+    }
+  ]
+}
