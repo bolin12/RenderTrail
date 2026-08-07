@@ -105,6 +105,7 @@ namespace UE::RenderTrail::Private
 		Json->TryGetStringField(TEXT("format"), Resource.Format);
 		Json->TryGetStringField(TEXT("stage"), Resource.Stage);
 		Json->TryGetStringField(TEXT("access"), Resource.Access);
+		Json->TryGetStringField(TEXT("shaderBinding"), Resource.ShaderBinding);
 		Json->TryGetBoolField(TEXT("texture"), Resource.bTexture);
 		double Number = 0.0;
 		if (Json->TryGetNumberField(TEXT("resourceIndex"), Number))
@@ -115,6 +116,16 @@ namespace UE::RenderTrail::Private
 			Resource.Height = static_cast<int32>(Number);
 		if (Json->TryGetNumberField(TEXT("samples"), Number))
 			Resource.Samples = static_cast<int32>(Number);
+		if (Json->TryGetNumberField(TEXT("bindingIndex"), Number))
+			Resource.BindingIndex = static_cast<int32>(Number);
+		if (Json->TryGetNumberField(TEXT("arrayElement"), Number))
+			Resource.ArrayElement = static_cast<int32>(Number);
+		if (Json->TryGetNumberField(TEXT("firstMip"), Number))
+			Resource.FirstMip = static_cast<int32>(Number);
+		if (Json->TryGetNumberField(TEXT("firstSlice"), Number))
+			Resource.FirstSlice = static_cast<int32>(Number);
+		if (Json->TryGetNumberField(TEXT("typeCast"), Number))
+			Resource.TypeCast = static_cast<int32>(Number);
 		return Resource;
 	}
 
@@ -342,13 +353,16 @@ namespace UE::RenderTrail::Private
 					InputJson->SetStringField(TEXT("name"), Input.Name);
 					InputJson->SetStringField(TEXT("format"), Input.Format);
 					InputJson->SetStringField(TEXT("access"), Input.Access);
+					InputJson->SetStringField(TEXT("shaderBinding"), Input.ShaderBinding);
 					InputJson->SetNumberField(TEXT("width"), Input.Width);
 					InputJson->SetNumberField(TEXT("height"), Input.Height);
+					InputJson->SetNumberField(TEXT("samples"), Input.Samples);
 					InputJson->SetStringField(TEXT("pixelContribution"), TEXT("not-proven-from-binding-alone"));
 					Inputs.Add(MakeShared<FJsonValueObject>(InputJson));
 				}
 				Hop->SetArrayField(TEXT("boundInputCandidates"), MoveTemp(Inputs));
 				Hop->SetArrayField(TEXT("resourceDependencies"), Context->ResourceProvenance);
+				Hop->SetArrayField(TEXT("resourcePixelHistories"), Context->ResourcePixelHistories);
 			}
 			else
 			{

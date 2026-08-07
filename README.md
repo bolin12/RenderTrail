@@ -10,6 +10,7 @@ RenderDoc Replay 运行在插件拥有的独立 Worker 进程中；编辑器负�
 - 一次只选择并分析一个像素，避免跨像素证据混合。
 - 展示 Before/After 颜色、末端写入、显著上游候选和颜色差值。
 - 整理 Pass、固定 Pipeline、Shader Reflection、DebugPixel 和资源 producer 证据。
+- 自动把跨资源链拆成 `(resource, pixel, mip, slice, sample)` 分支；MSAA 输入逐 sample 查询 Pixel History，有实际像素 writer 的分支才继续上溯。
 - 用“已确认、候选、断点”区分证据强度，不虚构缺失的坐标映射、材质、Mesh 或 Actor 归属。
 - Agent 只总结已经收集的有界证据，不自行选择或猜测 RenderDoc 事件。
 
@@ -33,3 +34,5 @@ RenderDoc Replay 运行在插件拥有的独立 Worker 进程中；编辑器负�
 - 完整诊断默认配置：`Config/RenderTrailDiagnostics.ini`
 
 当前版本为 Beta，插件清单版本为 `0.4.0`。
+
+确定性溯源分为两个队列：Agent 只等待根事件、候选 Shader 调试和每个直接输入的 `sample 0` 快速前沿；其余 MSAA sample 与递归 producer 继续在后台有界深追。诊断日志会记录每个请求的排队、Worker 阶段、完成耗时，以及快速/后台队列余量。

@@ -72,7 +72,10 @@ namespace UE::RenderTrail::Private::AgentProtocol
 					}
 					else
 					{
-						Repaired.AppendChar(BracketStack.Pop() == TEXT('{') ? TEXT('}') : TEXT(']'));
+						// A frequent model error is an extra array closer after a correctly
+						// closed object (`..."evidence":"..."}],`). Dropping that unmatched
+						// closer preserves the still-open parent object. Closing the parent here
+						// would make every following field appear outside the root JSON object.
 						bOutRepaired = true;
 					}
 					continue;
@@ -90,20 +93,34 @@ namespace UE::RenderTrail::Private::AgentProtocol
 	}
 
 	bool TryParseActionJson(const FString& Content, FString& OutJson,
-		TSharedPtr<FJsonObject>& OutAction, bool& bOutRepaired)
+		TSharedPtr<FJsonObject>& OutAction, bool& bOutRepaired, FString* OutError)
 	{
+		if (OutError)
+		{
+			OutError->Empty();
+		}
 		OutJson = ExtractJsonObject(Content);
 		OutAction.Reset();
 		bOutRepaired = false;
 		if (OutJson.IsEmpty())
 		{
+			if (OutError)
+			{
+				*OutError = TEXT("No complete JSON object delimiters were found in the model content.");
+			}
 			return false;
 		}
 
-		const auto TryParse = [&OutAction](const FString& Candidate) -> bool
+		FString LastParseError;
+		const auto TryParse = [&OutAction, &LastParseError](const FString& Candidate) -> bool
 		{
 			const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Candidate);
-			return FJsonSerializer::Deserialize(Reader, OutAction) && OutAction.IsValid();
+			const bool bParsed = FJsonSerializer::Deserialize(Reader, OutAction) && OutAction.IsValid();
+			if (!bParsed)
+			{
+				LastParseError = Reader->GetErrorMessage();
+			}
+			return bParsed;
 		};
 		if (TryParse(OutJson))
 		{
@@ -114,6 +131,12 @@ namespace UE::RenderTrail::Private::AgentProtocol
 		const FString RepairedJson = RepairJsonBrackets(OutJson, bRepaired);
 		if (!bRepaired || !TryParse(RepairedJson))
 		{
+			if (OutError)
+			{
+				*OutError = bRepaired
+					? FString::Printf(TEXT("JSON remained invalid after bounded closer repair: %s"), *LastParseError)
+					: FString::Printf(TEXT("JSON parsing failed and no bounded closer repair applied: %s"), *LastParseError);
+			}
 			return false;
 		}
 		OutJson = RepairedJson;

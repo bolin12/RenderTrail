@@ -26,6 +26,18 @@ namespace UE::RenderTrail::Private
 		}
 
 		Action.Reset();
+		const bool bParsedExtraCloser = AgentProtocol::TryParseActionJson(
+			TEXT("{\"action\":\"finish\",\"influence\":{\"eventId\":7}] ,\"confidence\":\"low\"}"),
+			Json, Action, bRepaired);
+		TestTrue(TEXT("Drops an extra array closer without prematurely closing the root object"), bParsedExtraCloser);
+		TestTrue(TEXT("Extra closer JSON is marked repaired"), bRepaired);
+		if (Action.IsValid())
+		{
+			TestEqual(TEXT("Fields after the repaired closer remain in the root object"),
+				Action->GetStringField(TEXT("confidence")), FString(TEXT("low")));
+		}
+
+		Action.Reset();
 		const bool bParsedRepaired = AgentProtocol::TryParseActionJson(
 			TEXT("{\"action\":\"finish\",\"unknowns\":[{\"name\":\"gap\"]}"), Json, Action, bRepaired);
 		TestTrue(TEXT("Repairs a bounded mismatched closer before strict parsing"), bParsedRepaired);

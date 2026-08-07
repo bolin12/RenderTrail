@@ -14,6 +14,7 @@ namespace UE::RenderTrail::Private
 		const ResourceId& InputResource,
 		uint32 ConsumerEventId,
 		const FString& ResourceName,
+		const FString& ShaderBinding,
 		int32 ResourceIndex,
 		const TextureDescription* InputTexture,
 		const TextureDescription* OutputTexture,

@@ -86,6 +86,7 @@ namespace UE::RenderTrail::Private
 		const ResourceId& InputResource,
 		uint32 ConsumerEventId,
 		const FString& ResourceName,
+		const FString& ShaderBinding,
 		int32 ResourceIndex,
 		const TextureDescription* InputTexture,
 		const TextureDescription* OutputTexture,
@@ -95,6 +96,7 @@ namespace UE::RenderTrail::Private
 	{
 		const TSharedRef<FJsonObject> Provenance = MakeShared<FJsonObject>();
 		Provenance->SetStringField(TEXT("resource"), ResourceName.IsEmpty() ? TEXT("Unnamed resource") : ResourceName);
+		Provenance->SetStringField(TEXT("shaderBinding"), ShaderBinding);
 		Provenance->SetNumberField(TEXT("resourceIndex"), ResourceIndex);
 		Provenance->SetStringField(TEXT("readEvidence"), TEXT("event-descriptor-access"));
 		Provenance->SetStringField(TEXT("pixelContribution"), TEXT("not-proven-from-binding-or-descriptor-access-alone"));

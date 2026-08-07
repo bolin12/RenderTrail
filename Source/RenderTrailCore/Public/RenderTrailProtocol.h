@@ -4,7 +4,8 @@
 
 namespace UE::RenderTrail
 {
-	inline constexpr int32 ProtocolVersion = 2;
+	inline constexpr int32 CaptureMetadataSchemaVersion = 2;
+	inline constexpr int32 ReplayWorkerProtocolVersion = 3;
 	inline constexpr const TCHAR* MetadataExtension = TEXT("rendertrail.json");
 
 	struct RENDERTRAILCORE_API FCaptureMetadata

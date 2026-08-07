@@ -25,7 +25,7 @@ namespace UE::RenderTrail
 	FString FCaptureMetadata::ToJson() const
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-		Root->SetNumberField(TEXT("schemaVersion"), ProtocolVersion);
+		Root->SetNumberField(TEXT("schemaVersion"), CaptureMetadataSchemaVersion);
 		Root->SetStringField(TEXT("capturePath"), CapturePath);
 		Root->SetStringField(TEXT("projectName"), ProjectName);
 		Root->SetStringField(TEXT("projectDirectory"), ProjectDirectory);
@@ -56,9 +56,10 @@ namespace UE::RenderTrail
 		}
 
 		const int32 SchemaVersion = static_cast<int32>(Root->GetNumberField(TEXT("schemaVersion")));
-		if (SchemaVersion != ProtocolVersion)
+		if (SchemaVersion != CaptureMetadataSchemaVersion)
 		{
-			OutError = FString::Printf(TEXT("Unsupported metadata schema %d (expected %d)."), SchemaVersion, ProtocolVersion);
+			OutError = FString::Printf(TEXT("Unsupported metadata schema %d (expected %d)."),
+				SchemaVersion, CaptureMetadataSchemaVersion);
 			return false;
 		}
 

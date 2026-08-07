@@ -1,6 +1,7 @@
 #include "RenderTrailReplayWorkerClient.h"
 
 #include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
 
 namespace UE::RenderTrail::Private
@@ -64,13 +65,17 @@ namespace UE::RenderTrail::Private
 		return true;
 	}
 
-	void FRenderTrailReplayWorkerClient::Stop()
+	FRenderTrailReplayWorkerStopResult FRenderTrailReplayWorkerClient::Stop()
 	{
+		FRenderTrailReplayWorkerStopResult Result;
+		const double StopStartSeconds = FPlatformTime::Seconds();
 		if (ProcessHandle.IsValid())
 		{
+			Result.bHadProcess = true;
+			Result.bWasRunning = FPlatformProcess::IsProcRunning(ProcessHandle);
 			if (StdInWrite && FPlatformProcess::IsProcRunning(ProcessHandle))
 			{
-				FPlatformProcess::WritePipe(StdInWrite, TEXT("{\"command\":\"shutdown\"}"));
+				Result.bShutdownWritten = FPlatformProcess::WritePipe(StdInWrite, TEXT("{\"command\":\"shutdown\"}"));
 				for (int32 Attempt = 0; Attempt < 20 && FPlatformProcess::IsProcRunning(ProcessHandle); ++Attempt)
 				{
 					FPlatformProcess::Sleep(0.05f);
@@ -78,7 +83,12 @@ namespace UE::RenderTrail::Private
 			}
 			if (FPlatformProcess::IsProcRunning(ProcessHandle))
 			{
+				Result.bForcedTermination = true;
 				FPlatformProcess::TerminateProc(ProcessHandle, true);
+			}
+			else if (Result.bWasRunning)
+			{
+				Result.bExitedGracefully = true;
 			}
 			FPlatformProcess::CloseProc(ProcessHandle);
 			ProcessHandle.Reset();
@@ -87,6 +97,8 @@ namespace UE::RenderTrail::Private
 		OutputBuffer.Empty();
 		ErrorBuffer.Empty();
 		bExitReported = false;
+		Result.ElapsedSeconds = FPlatformTime::Seconds() - StopStartSeconds;
+		return Result;
 	}
 
 	FRenderTrailReplayWorkerPollResult FRenderTrailReplayWorkerClient::Poll()

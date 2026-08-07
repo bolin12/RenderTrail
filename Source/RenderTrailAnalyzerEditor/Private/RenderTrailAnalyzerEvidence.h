@@ -124,10 +124,16 @@ namespace UE::RenderTrail::Private
 		FString Format;
 		FString Stage;
 		FString Access;
+		FString ShaderBinding;
 		bool bTexture = false;
 		int32 Width = 0;
 		int32 Height = 0;
 		int32 Samples = 1;
+		int32 BindingIndex = INDEX_NONE;
+		int32 ArrayElement = 0;
+		int32 FirstMip = 0;
+		int32 FirstSlice = 0;
+		int32 TypeCast = INDEX_NONE;
 	};
 
 	struct FEventContextEvidence
@@ -151,6 +157,7 @@ namespace UE::RenderTrail::Private
 		TArray<FBoundResourceEvidence> Inputs;
 		TArray<FBoundResourceEvidence> Outputs;
 		TArray<TSharedPtr<FJsonValue>> ResourceProvenance;
+		TArray<TSharedPtr<FJsonValue>> ResourcePixelHistories;
 		TSharedPtr<FJsonObject> PipelineState;
 		TSharedPtr<FJsonObject> ShaderDebugTrace;
 	};

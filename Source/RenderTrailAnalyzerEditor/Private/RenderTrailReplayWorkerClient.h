@@ -13,6 +13,16 @@ namespace UE::RenderTrail::Private
 		bool bExited = false;
 	};
 
+	struct FRenderTrailReplayWorkerStopResult
+	{
+		double ElapsedSeconds = 0.0;
+		bool bHadProcess = false;
+		bool bWasRunning = false;
+		bool bShutdownWritten = false;
+		bool bExitedGracefully = false;
+		bool bForcedTermination = false;
+	};
+
 	class FRenderTrailReplayWorkerClient final
 	{
 	public:
@@ -22,7 +32,7 @@ namespace UE::RenderTrail::Private
 
 		bool Launch(const FString& WorkerPath, const FString& CapturePath, const FString& PreviewPath,
 			bool bFullDiagnostics, FString& OutCommandLine, FString& OutError);
-		void Stop();
+		FRenderTrailReplayWorkerStopResult Stop();
 		FRenderTrailReplayWorkerPollResult Poll();
 		bool Write(const FString& Payload);
 

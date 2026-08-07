@@ -52,6 +52,24 @@ DEFINE_LOG_CATEGORY_STATIC(LogRenderTrailAnalyzer, Log, All);
 
 namespace UE::RenderTrail::Private
 {
+	struct FResourcePixelHistoryRequest
+	{
+		uint32 ConsumerEventId = 0;
+		int32 ResourceIndex = INDEX_NONE;
+		FString ResourceName;
+		FString ShaderBinding;
+		FString Mapping;
+		FString MappingConfidence;
+		FString TraceKey;
+		FIntPoint Pixel = FIntPoint::ZeroValue;
+		int32 Mip = 0;
+		int32 Slice = 0;
+		int32 Sample = 0;
+		int32 TypeCast = INDEX_NONE;
+		int32 ReverseDepth = 0;
+		bool bRequiredForAgent = false;
+	};
+
 	class SAnalyzerHome final : public SCompoundWidget
 	{
 	public:
@@ -384,6 +402,34 @@ namespace UE::RenderTrail::Private
 						Now - CaptureLoadStartSeconds, *CaptureLoadPhase));
 					LastCaptureLoadStatusSeconds = Now;
 				}
+				if (Now - LastWorkerHeartbeatSeconds >= 5.0)
+				{
+					WriteWorkerHeartbeat(Now, TEXT("capture_load"));
+				}
+			}
+			else if (ReplayWorker.IsRunning() && HasPendingWorkerRequests())
+			{
+				const double Now = FPlatformTime::Seconds();
+				if (!ActiveWorkerRequestId.IsEmpty() && Now - LastReplayQueryStatusSeconds >= 0.5)
+				{
+					const double RequestElapsed = ActiveWorkerRequestStartSeconds > 0.0
+						? Now - ActiveWorkerRequestStartSeconds : 0.0;
+					const FString QueryStatus = FString::Printf(
+						TEXT("Replay 查询中：%s · %s · %.1fs；必需 %d，后台 %d，事件 %d，Shader %d"),
+						*ActiveWorkerRequestId, ActiveWorkerStage.IsEmpty() ? TEXT("waiting") : *ActiveWorkerStage,
+						RequestElapsed, GetPendingRequiredResourceHistoryCount(), GetPendingBackgroundResourceHistoryCount(),
+						PendingEventContextIds.Num(), PendingShaderDebugByRequest.Num());
+					SetStatus(QueryStatus);
+					if (bAgentWaitingForDeterministicContexts)
+					{
+						SetAgentStatus(TEXT("快速前沿 · ") + QueryStatus);
+					}
+					LastReplayQueryStatusSeconds = Now;
+				}
+				if (Now - LastWorkerHeartbeatSeconds >= 5.0)
+				{
+					WriteWorkerHeartbeat(Now, TEXT("replay_query"));
+				}
 			}
 		}
 
@@ -422,6 +468,93 @@ namespace UE::RenderTrail::Private
 			bCaptureLoading = false;
 			UE_LOG(LogRenderTrailAnalyzer, Display, TEXT("Capture load finished: elapsed=%.3fs result=%s capture='%s'"),
 				Elapsed, *Result, *GetCapturePath());
+		}
+
+		bool HasPendingWorkerRequests() const
+		{
+			return !PendingSampleByRequest.IsEmpty()
+				|| !PendingEventContextByRequest.IsEmpty()
+				|| !PendingShaderDebugByRequest.IsEmpty()
+				|| !PendingResourcePixelHistoryByRequest.IsEmpty();
+		}
+
+		int32 GetPendingRequiredResourceHistoryCount() const
+		{
+			int32 Count = 0;
+			for (const TPair<FString, FResourcePixelHistoryRequest>& Pair : PendingResourcePixelHistoryByRequest)
+			{
+				Count += Pair.Value.bRequiredForAgent ? 1 : 0;
+			}
+			return Count;
+		}
+
+		int32 GetPendingBackgroundResourceHistoryCount() const
+		{
+			int32 Count = PendingResourcePixelHistoryByRequest.Num() - GetPendingRequiredResourceHistoryCount();
+			for (const TPair<uint32, int32>& Pair : DeferredResourceHistoryBranchCounts)
+			{
+				Count += Pair.Value;
+			}
+			return Count;
+		}
+
+		bool IsCriticalAgentEvent(uint32 EventId) const
+		{
+			return (LastCandidate.IsSet() && LastCandidate->Event.EventId == EventId)
+				|| (LastSignificantCandidate.IsSet() && LastSignificantCandidate->Event.EventId == EventId);
+		}
+
+		int32 GetPendingCriticalContextCount() const
+		{
+			int32 Count = 0;
+			for (const uint32 EventId : PendingEventContextIds)
+			{
+				Count += IsCriticalAgentEvent(EventId) ? 1 : 0;
+			}
+			return Count;
+		}
+
+		bool HasPendingCriticalDeterministicQueries() const
+		{
+			if (!PendingShaderDebugByRequest.IsEmpty() || GetPendingRequiredResourceHistoryCount() > 0)
+			{
+				return true;
+			}
+			return GetPendingCriticalContextCount() > 0;
+		}
+
+		bool HasPendingBackgroundDeterministicQueries() const
+		{
+			if (GetPendingBackgroundResourceHistoryCount() > 0 || !DeferredEventContextIds.IsEmpty())
+			{
+				return true;
+			}
+			for (const uint32 EventId : PendingEventContextIds)
+			{
+				if (!IsCriticalAgentEvent(EventId))
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		void WriteWorkerHeartbeat(double Now, const TCHAR* Activity)
+		{
+			const double Elapsed = bCaptureLoading ? Now - CaptureLoadStartSeconds : 0.0;
+			const FString Phase = LastWorkerDiagnosticPhase.IsEmpty() ? CaptureLoadPhase : LastWorkerDiagnosticPhase;
+			const FString Detail = FString::Printf(
+				TEXT("activity=%s elapsed=%.3fs running=%s phase='%s' request='%s' requestElapsed=%.3fs pendingPixel=%d pendingContext=%d pendingShader=%d pendingResourceRequired=%d pendingResourceBackground=%d"),
+				Activity, Elapsed, ReplayWorker.IsRunning() ? TEXT("true") : TEXT("false"), *Phase,
+				*ActiveWorkerRequestId, ActiveWorkerRequestStartSeconds > 0.0 ? Now - ActiveWorkerRequestStartSeconds : 0.0,
+				PendingSampleByRequest.Num(), PendingEventContextByRequest.Num(), PendingShaderDebugByRequest.Num(),
+				GetPendingRequiredResourceHistoryCount(), GetPendingBackgroundResourceHistoryCount());
+			UE_LOG(LogRenderTrailAnalyzer, Display, TEXT("Replay Worker heartbeat: %s"), *Detail);
+			if (Diagnostics.HasSession() && Diagnostics.GetOptions().bWorkerProtocol)
+			{
+				Diagnostics.WriteRecord(TEXT("worker_wait"), Detail);
+			}
+			LastWorkerHeartbeatSeconds = Now;
 		}
 
 		void SetEvidence(const FString& Value)
@@ -484,6 +617,193 @@ namespace UE::RenderTrail::Private
 			AgentMessages.Add(MakeShared<FJsonValueObject>(Message));
 		}
 
+		TSharedRef<FJsonObject> BuildCompactResourceHistoryForAgent(const TSharedPtr<FJsonObject>& History) const
+		{
+			TSharedRef<FJsonObject> Compact = MakeShared<FJsonObject>();
+			if (!History.IsValid())
+			{
+				Compact->SetStringField(TEXT("branchStatus"), TEXT("invalid-history"));
+				return Compact;
+			}
+			static const TCHAR* StringFields[] = {
+				TEXT("resourceName"), TEXT("shaderBinding"), TEXT("coordinateMapping"), TEXT("mappingConfidence"),
+				TEXT("branchStatus"), TEXT("detail"), TEXT("error"), TEXT("shaderAccessDisassembly") };
+			for (const TCHAR* Field : StringFields)
+			{
+				FString Value;
+				if (History->TryGetStringField(Field, Value))
+				{
+					Compact->SetStringField(Field, Value.Left(800));
+				}
+			}
+			static const TCHAR* NumberFields[] = {
+				TEXT("consumerEventId"), TEXT("resourceIndex"), TEXT("x"), TEXT("y"), TEXT("mip"), TEXT("slice"),
+				TEXT("sample"), TEXT("totalModifications"), TEXT("totalEvents"), TEXT("shaderAccessInstruction"),
+				TEXT("queueToResponseSeconds") };
+			for (const TCHAR* Field : NumberFields)
+			{
+				double Value = 0.0;
+				if (History->TryGetNumberField(Field, Value))
+				{
+					Compact->SetNumberField(Field, Value);
+				}
+			}
+			static const TCHAR* BoolFields[] = {
+				TEXT("requiredForAgent"), TEXT("detailTailTruncated"), TEXT("shaderAccessObserved"),
+				TEXT("shaderCoordinateValuesMatched") };
+			for (const TCHAR* Field : BoolFields)
+			{
+				bool bValue = false;
+				if (History->TryGetBoolField(Field, bValue))
+				{
+					Compact->SetBoolField(Field, bValue);
+				}
+			}
+			const TArray<TSharedPtr<FJsonValue>>* Aliases = nullptr;
+			if (History->TryGetArrayField(TEXT("shaderBindingAliases"), Aliases) && Aliases)
+			{
+				Compact->SetArrayField(TEXT("shaderBindingAliases"), *Aliases);
+			}
+			const TArray<TSharedPtr<FJsonValue>>* WriterIds = nullptr;
+			if (History->TryGetArrayField(TEXT("confirmedWriterEventIds"), WriterIds) && WriterIds)
+			{
+				Compact->SetArrayField(TEXT("confirmedWriterEventIds"), *WriterIds);
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* EventSummaries = nullptr;
+			TArray<TSharedPtr<FJsonValue>> CompactEvents;
+			if (History->TryGetArrayField(TEXT("eventSummaries"), EventSummaries) && EventSummaries)
+			{
+				const int32 First = FMath::Max(0, EventSummaries->Num() - MaxAgentEventsPerResourceHistory);
+				for (int32 Index = First; Index < EventSummaries->Num(); ++Index)
+				{
+					const TSharedPtr<FJsonObject> Event = (*EventSummaries)[Index].IsValid()
+						? (*EventSummaries)[Index]->AsObject() : nullptr;
+					if (!Event.IsValid())
+					{
+						continue;
+					}
+					TSharedRef<FJsonObject> CompactEvent = MakeShared<FJsonObject>();
+					double Number = 0.0;
+					FString TextValue;
+					bool bValue = false;
+					if (Event->TryGetNumberField(TEXT("eventId"), Number)) CompactEvent->SetNumberField(TEXT("eventId"), Number);
+					if (Event->TryGetNumberField(TEXT("passedFragments"), Number)) CompactEvent->SetNumberField(TEXT("passedFragments"), Number);
+					if (Event->TryGetNumberField(TEXT("rejectedFragments"), Number)) CompactEvent->SetNumberField(TEXT("rejectedFragments"), Number);
+					if (Event->TryGetStringField(TEXT("action"), TextValue)) CompactEvent->SetStringField(TEXT("action"), TextValue);
+					if (Event->TryGetStringField(TEXT("actionKind"), TextValue)) CompactEvent->SetStringField(TEXT("actionKind"), TextValue);
+					if (Event->TryGetStringField(TEXT("markerPath"), TextValue)) CompactEvent->SetStringField(TEXT("marker"), CompactMarkerPath(TextValue));
+					if (Event->TryGetBoolField(TEXT("changedTextureValue"), bValue)) CompactEvent->SetBoolField(TEXT("changedTextureValue"), bValue);
+					if (Event->TryGetBoolField(TEXT("directShaderWrite"), bValue)) CompactEvent->SetBoolField(TEXT("directShaderWrite"), bValue);
+					const TSharedPtr<FJsonObject>* PixelValue = nullptr;
+					if (Event->TryGetObjectField(TEXT("firstBefore"), PixelValue) && PixelValue) CompactEvent->SetObjectField(TEXT("firstBefore"), *PixelValue);
+					if (Event->TryGetObjectField(TEXT("lastShaderOutput"), PixelValue) && PixelValue) CompactEvent->SetObjectField(TEXT("lastShaderOutput"), *PixelValue);
+					if (Event->TryGetObjectField(TEXT("lastAfter"), PixelValue) && PixelValue) CompactEvent->SetObjectField(TEXT("lastAfter"), *PixelValue);
+					CompactEvents.Add(MakeShared<FJsonValueObject>(CompactEvent));
+				}
+			}
+			Compact->SetArrayField(TEXT("latestEventSummaries"), MoveTemp(CompactEvents));
+			return Compact;
+		}
+
+		TSharedRef<FJsonObject> BuildCompactShaderDebugForAgent(const TSharedPtr<FJsonObject>& Trace) const
+		{
+			TSharedRef<FJsonObject> Compact = MakeShared<FJsonObject>();
+			if (!Trace.IsValid())
+			{
+				return Compact;
+			}
+			static const TCHAR* StringFields[] = { TEXT("stage"), TEXT("debugStatus") };
+			for (const TCHAR* Field : StringFields)
+			{
+				FString Value;
+				if (Trace->TryGetStringField(Field, Value)) Compact->SetStringField(Field, Value);
+			}
+			static const TCHAR* NumberFields[] = { TEXT("eventId"), TEXT("x"), TEXT("y"), TEXT("sample"),
+				TEXT("instructionInfoCount"), TEXT("sourceVariableMappingCount"), TEXT("stepCount"), TEXT("textureAccessCount") };
+			for (const TCHAR* Field : NumberFields)
+			{
+				double Value = 0.0;
+				if (Trace->TryGetNumberField(Field, Value)) Compact->SetNumberField(Field, Value);
+			}
+			bool bCompleted = false;
+			if (Trace->TryGetBoolField(TEXT("completed"), bCompleted)) Compact->SetBoolField(TEXT("completed"), bCompleted);
+			const TArray<TSharedPtr<FJsonValue>>* Accesses = nullptr;
+			TArray<TSharedPtr<FJsonValue>> CompactAccesses;
+			if (Trace->TryGetArrayField(TEXT("textureAccesses"), Accesses) && Accesses)
+			{
+				for (int32 Index = 0; Index < Accesses->Num() && Index < MaxAgentTextureAccesses; ++Index)
+				{
+					const TSharedPtr<FJsonObject> Access = (*Accesses)[Index].IsValid() ? (*Accesses)[Index]->AsObject() : nullptr;
+					if (!Access.IsValid()) continue;
+					TSharedRef<FJsonObject> CompactAccess = MakeShared<FJsonObject>();
+					double Number = 0.0;
+					FString Disassembly;
+					if (Access->TryGetNumberField(TEXT("instruction"), Number)) CompactAccess->SetNumberField(TEXT("instruction"), Number);
+					if (Access->TryGetStringField(TEXT("disassembly"), Disassembly)) CompactAccess->SetStringField(TEXT("disassembly"), Disassembly.Left(600));
+					const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+					TArray<TSharedPtr<FJsonValue>> CompactVariables;
+					if (Access->TryGetArrayField(TEXT("variables"), Variables) && Variables)
+					{
+						for (const TSharedPtr<FJsonValue>& VariableValue : *Variables)
+						{
+							const TSharedPtr<FJsonObject> Variable = VariableValue.IsValid() ? VariableValue->AsObject() : nullptr;
+							if (!Variable.IsValid()) continue;
+							TSharedRef<FJsonObject> CompactVariable = MakeShared<FJsonObject>();
+							FString Name;
+							if (Variable->TryGetStringField(TEXT("name"), Name)) CompactVariable->SetStringField(TEXT("name"), Name);
+							const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+							if (Variable->TryGetArrayField(TEXT("values"), Values) && Values) CompactVariable->SetArrayField(TEXT("values"), *Values);
+							CompactVariables.Add(MakeShared<FJsonValueObject>(CompactVariable));
+						}
+					}
+					CompactAccess->SetArrayField(TEXT("variables"), MoveTemp(CompactVariables));
+					CompactAccesses.Add(MakeShared<FJsonValueObject>(CompactAccess));
+				}
+			}
+			Compact->SetArrayField(TEXT("textureAccesses"), MoveTemp(CompactAccesses));
+			return Compact;
+		}
+
+		TSharedRef<FJsonObject> BuildCompactResourceProvenanceForAgent(
+			const TSharedPtr<FJsonObject>& Provenance) const
+		{
+			TSharedRef<FJsonObject> Compact = MakeShared<FJsonObject>();
+			if (!Provenance.IsValid())
+			{
+				return Compact;
+			}
+			static const TCHAR* StringFields[] = {
+				TEXT("resource"), TEXT("shaderBinding"), TEXT("readEvidence"), TEXT("pixelContribution"),
+				TEXT("pixelTraceStatus"), TEXT("dimensionRelation"), TEXT("coordinateMapping"),
+				TEXT("producerUsage"), TEXT("producerStatus"), TEXT("relation"), TEXT("producerAction"),
+				TEXT("producerKind"), TEXT("chainBreak") };
+			for (const TCHAR* Field : StringFields)
+			{
+				FString Value;
+				if (Provenance->TryGetStringField(Field, Value))
+				{
+					Compact->SetStringField(Field, Value.Left(800));
+				}
+			}
+			static const TCHAR* NumberFields[] = {
+				TEXT("resourceIndex"), TEXT("producerEventId"), TEXT("invalidatingEventId") };
+			for (const TCHAR* Field : NumberFields)
+			{
+				double Value = 0.0;
+				if (Provenance->TryGetNumberField(Field, Value))
+				{
+					Compact->SetNumberField(Field, Value);
+				}
+			}
+			bool bProducerFound = false;
+			if (Provenance->TryGetBoolField(TEXT("producerFound"), bProducerFound))
+			{
+				Compact->SetBoolField(TEXT("producerFound"), bProducerFound);
+			}
+			return Compact;
+		}
+
 		FString BuildAgentPrefilterEvidence() const
 		{
 			TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
@@ -491,6 +811,13 @@ namespace UE::RenderTrail::Private
 			Root->SetStringField(TEXT("capture"), FPaths::GetCleanFilename(GetCapturePath()));
 			Root->SetStringField(TEXT("ruleSummary"), LastReportSummary);
 			Root->SetStringField(TEXT("boundedCausalPath"), LastReportCausalPath);
+			TSharedRef<FJsonObject> ReplayTarget = MakeShared<FJsonObject>();
+			ReplayTarget->SetNumberField(TEXT("resourceIndex"), ReplayTargetResourceIndex);
+			ReplayTarget->SetNumberField(TEXT("width"), CurrentPreviewSize.X);
+			ReplayTarget->SetNumberField(TEXT("height"), CurrentPreviewSize.Y);
+			ReplayTarget->SetNumberField(TEXT("samples"), ReplayTargetSamples);
+			ReplayTarget->SetStringField(TEXT("format"), ReplayTargetFormat);
+			Root->SetObjectField(TEXT("replayTarget"), ReplayTarget);
 
 			FString MetadataJson;
 			UE::RenderTrail::FCaptureMetadata Metadata;
@@ -578,8 +905,24 @@ namespace UE::RenderTrail::Private
 				SampleJson->SetBoolField(TEXT("eventChainComplete"), Sample.bEventSummaryComplete && AgentChainFirst == 0);
 				SampleJson->SetNumberField(TEXT("eventChainEventCount"), Events.Num());
 				SampleJson->SetNumberField(TEXT("eventChainStartIndex"), AgentChainFirst);
-				SampleJson->SetObjectField(TEXT("causalGraph"),
-					BuildPixelCausalGraph(Sample, Events, EventContexts, MaxDisplayedFrontierResources));
+				TSharedRef<FJsonObject> AgentCausalGraph =
+					BuildPixelCausalGraph(Sample, Events, EventContexts, MaxDisplayedFrontierResources);
+				const TArray<TSharedPtr<FJsonValue>>* WriterHops = nullptr;
+				if (AgentCausalGraph->TryGetArrayField(TEXT("targetWriterHops"), WriterHops) && WriterHops)
+				{
+					for (const TSharedPtr<FJsonValue>& HopValue : *WriterHops)
+					{
+						const TSharedPtr<FJsonObject> Hop = HopValue.IsValid() ? HopValue->AsObject() : nullptr;
+						if (!Hop.IsValid()) continue;
+						const TArray<TSharedPtr<FJsonValue>>* Histories = nullptr;
+						if (Hop->TryGetArrayField(TEXT("resourcePixelHistories"), Histories) && Histories)
+						{
+							Hop->SetNumberField(TEXT("resourcePixelHistoryCount"), Histories->Num());
+							Hop->RemoveField(TEXT("resourcePixelHistories"));
+						}
+					}
+				}
+				SampleJson->SetObjectField(TEXT("causalGraph"), AgentCausalGraph);
 				SampleValues.Add(MakeShared<FJsonValueObject>(SampleJson));
 			}
 			Root->SetArrayField(TEXT("samples"), SampleValues);
@@ -616,16 +959,34 @@ namespace UE::RenderTrail::Private
 				Root->SetObjectField(TEXT("significantWriterCandidate"), CandidateJson);
 			}
 
-			TArray<TSharedPtr<FJsonValue>> DeterministicContexts;
-			for (const TPair<uint32, FEventContextEvidence>& Pair : EventContexts)
+			TArray<uint32> DeterministicContextIds;
+			EventContexts.GenerateKeyArray(DeterministicContextIds);
+			DeterministicContextIds.Sort([this](uint32 A, uint32 B)
 			{
-				const FEventContextEvidence& Context = Pair.Value;
+				const bool bCriticalA = IsCriticalAgentEvent(A);
+				const bool bCriticalB = IsCriticalAgentEvent(B);
+				if (bCriticalA != bCriticalB)
+				{
+					return bCriticalA;
+				}
+				const int32 DepthA = EventContextDepths.FindRef(A);
+				const int32 DepthB = EventContextDepths.FindRef(B);
+				return DepthA == DepthB ? A > B : DepthA < DepthB;
+			});
+
+			TArray<TSharedPtr<FJsonValue>> DeterministicContexts;
+			const int32 ContextCount = FMath::Min(DeterministicContextIds.Num(), MaxAgentDeterministicContexts);
+			for (int32 ContextIndex = 0; ContextIndex < ContextCount; ++ContextIndex)
+			{
+				const uint32 ContextEventId = DeterministicContextIds[ContextIndex];
+				const FEventContextEvidence& Context = EventContexts.FindChecked(ContextEventId);
+				const int32 ReverseDepth = EventContextDepths.FindRef(Context.EventId);
 				TSharedRef<FJsonObject> ContextJson = MakeShared<FJsonObject>();
 				ContextJson->SetNumberField(TEXT("eventId"), Context.EventId);
 				ContextJson->SetStringField(TEXT("action"), Context.Action);
 				ContextJson->SetStringField(TEXT("actionKind"), Context.ActionKind);
 				ContextJson->SetStringField(TEXT("marker"), CompactMarkerPath(Context.MarkerPath));
-				ContextJson->SetNumberField(TEXT("reverseDepth"), EventContextDepths.FindRef(Context.EventId));
+				ContextJson->SetNumberField(TEXT("reverseDepth"), ReverseDepth);
 				ContextJson->SetStringField(TEXT("shaderStage"), Context.ShaderStage);
 				ContextJson->SetStringField(TEXT("shaderEntry"), Context.ShaderEntry);
 				ContextJson->SetStringField(TEXT("shaderDebugStatus"), Context.ShaderDebugStatus);
@@ -638,31 +999,42 @@ namespace UE::RenderTrail::Private
 				ContextJson->SetNumberField(TEXT("samplerCount"), Context.ShaderSamplerCount);
 				ContextJson->SetNumberField(TEXT("readOnlyResourceCount"), Context.ShaderReadOnlyResourceCount);
 				ContextJson->SetNumberField(TEXT("readWriteResourceCount"), Context.ShaderReadWriteResourceCount);
-				if (Context.PipelineState.IsValid())
+				ContextJson->SetBoolField(TEXT("fixedFunctionStateAvailable"), Context.PipelineState.IsValid());
+				if (IsCriticalAgentEvent(Context.EventId) && Context.PipelineState.IsValid())
 				{
 					ContextJson->SetObjectField(TEXT("fixedFunctionState"), Context.PipelineState);
 				}
 				if (Context.ShaderDebugTrace.IsValid())
 				{
-					ContextJson->SetObjectField(TEXT("shaderDebugTrace"), Context.ShaderDebugTrace);
+					ContextJson->SetObjectField(TEXT("shaderDebugTrace"),
+						BuildCompactShaderDebugForAgent(Context.ShaderDebugTrace));
 				}
 				TArray<TSharedPtr<FJsonValue>> Inputs;
-				for (const FBoundResourceEvidence& Input : Context.Inputs)
+				for (int32 InputIndex = 0;
+					InputIndex < Context.Inputs.Num() && InputIndex < MaxAgentBoundResourcesPerContext;
+					++InputIndex)
 				{
+					const FBoundResourceEvidence& Input = Context.Inputs[InputIndex];
 					TSharedRef<FJsonObject> Resource = MakeShared<FJsonObject>();
 					Resource->SetNumberField(TEXT("resourceIndex"), Input.ResourceIndex);
 					Resource->SetStringField(TEXT("name"), Input.Name);
 					Resource->SetStringField(TEXT("format"), Input.Format);
 					Resource->SetStringField(TEXT("stage"), Input.Stage);
 					Resource->SetStringField(TEXT("access"), Input.Access);
+					Resource->SetStringField(TEXT("shaderBinding"), Input.ShaderBinding);
 					Resource->SetNumberField(TEXT("width"), Input.Width);
 					Resource->SetNumberField(TEXT("height"), Input.Height);
+					Resource->SetNumberField(TEXT("samples"), Input.Samples);
 					Inputs.Add(MakeShared<FJsonValueObject>(Resource));
 				}
 				ContextJson->SetArrayField(TEXT("inputs"), MoveTemp(Inputs));
+				ContextJson->SetNumberField(TEXT("inputCount"), Context.Inputs.Num());
 				TArray<TSharedPtr<FJsonValue>> Outputs;
-				for (const FBoundResourceEvidence& Output : Context.Outputs)
+				for (int32 OutputIndex = 0;
+					OutputIndex < Context.Outputs.Num() && OutputIndex < MaxAgentBoundResourcesPerContext;
+					++OutputIndex)
 				{
+					const FBoundResourceEvidence& Output = Context.Outputs[OutputIndex];
 					TSharedRef<FJsonObject> Resource = MakeShared<FJsonObject>();
 					Resource->SetNumberField(TEXT("resourceIndex"), Output.ResourceIndex);
 					Resource->SetStringField(TEXT("name"), Output.Name);
@@ -674,13 +1046,74 @@ namespace UE::RenderTrail::Private
 					Outputs.Add(MakeShared<FJsonValueObject>(Resource));
 				}
 				ContextJson->SetArrayField(TEXT("outputs"), MoveTemp(Outputs));
-				ContextJson->SetArrayField(TEXT("resourceProvenance"), Context.ResourceProvenance);
+				ContextJson->SetNumberField(TEXT("outputCount"), Context.Outputs.Num());
+
+				TArray<TSharedPtr<FJsonValue>> CompactProvenance;
+				for (int32 ProvenanceIndex = 0;
+					ProvenanceIndex < Context.ResourceProvenance.Num()
+						&& ProvenanceIndex < MaxAgentBoundResourcesPerContext;
+					++ProvenanceIndex)
+				{
+					const TSharedPtr<FJsonObject> Provenance = Context.ResourceProvenance[ProvenanceIndex].IsValid()
+						? Context.ResourceProvenance[ProvenanceIndex]->AsObject() : nullptr;
+					CompactProvenance.Add(MakeShared<FJsonValueObject>(
+						BuildCompactResourceProvenanceForAgent(Provenance)));
+				}
+				ContextJson->SetArrayField(TEXT("resourceProvenance"), MoveTemp(CompactProvenance));
+				ContextJson->SetNumberField(TEXT("resourceProvenanceCount"), Context.ResourceProvenance.Num());
+
+				TArray<TSharedPtr<FJsonValue>> CompactHistories;
+				for (int32 RequiredPass = 1;
+					RequiredPass >= 0 && CompactHistories.Num() < MaxAgentResourceHistoriesPerContext;
+					--RequiredPass)
+				{
+					for (const TSharedPtr<FJsonValue>& HistoryValue : Context.ResourcePixelHistories)
+					{
+						const TSharedPtr<FJsonObject> History = HistoryValue.IsValid()
+							? HistoryValue->AsObject() : nullptr;
+						if (!History.IsValid())
+						{
+							continue;
+						}
+						bool bRequired = false;
+						History->TryGetBoolField(TEXT("requiredForAgent"), bRequired);
+						if (bRequired != (RequiredPass == 1))
+						{
+							continue;
+						}
+						CompactHistories.Add(MakeShared<FJsonValueObject>(
+							BuildCompactResourceHistoryForAgent(History)));
+						if (CompactHistories.Num() >= MaxAgentResourceHistoriesPerContext)
+						{
+							break;
+						}
+					}
+				}
+				ContextJson->SetArrayField(TEXT("resourcePixelHistories"), MoveTemp(CompactHistories));
+				ContextJson->SetNumberField(TEXT("resourcePixelHistoryCount"), Context.ResourcePixelHistories.Num());
 				DeterministicContexts.Add(MakeShared<FJsonValueObject>(ContextJson));
 			}
 			Root->SetArrayField(TEXT("deterministicEventContexts"), MoveTemp(DeterministicContexts));
-			Root->SetBoolField(TEXT("deterministicContextCollectionComplete"), PendingEventContextIds.IsEmpty());
+			Root->SetNumberField(TEXT("deterministicEventContextCount"), EventContexts.Num());
+			Root->SetNumberField(TEXT("deterministicEventContextsIncluded"), ContextCount);
+			Root->SetBoolField(TEXT("criticalDeterministicCollectionComplete"),
+				!HasPendingCriticalDeterministicQueries());
+			Root->SetBoolField(TEXT("backgroundDeterministicCollectionPending"),
+				HasPendingBackgroundDeterministicQueries());
+			Root->SetNumberField(TEXT("pendingCriticalEventContexts"), GetPendingCriticalContextCount());
+			Root->SetNumberField(TEXT("pendingRequiredResourcePixelHistories"),
+				GetPendingRequiredResourceHistoryCount());
+			Root->SetNumberField(TEXT("pendingBackgroundResourcePixelHistories"),
+				GetPendingBackgroundResourceHistoryCount());
+			Root->SetBoolField(TEXT("deterministicContextCollectionComplete"),
+				PendingEventContextIds.IsEmpty() && PendingResourcePixelHistoryByRequest.IsEmpty()
+					&& PendingShaderDebugByRequest.IsEmpty());
 			Root->SetNumberField(TEXT("deterministicContextFailureCount"), FailedEventContextIds.Num());
 			Root->SetNumberField(TEXT("shaderDebugFailureCount"), FailedShaderDebugIds.Num());
+			Root->SetNumberField(TEXT("resourcePixelHistoryFailureCount"), FailedResourcePixelHistoryKeys.Num());
+			Root->SetNumberField(TEXT("resourcePixelHistoryQueryCount"), ResourcePixelHistoryQueriesSubmitted);
+			Root->SetNumberField(TEXT("resourcePixelHistoryBranchCount"), ScheduledResourcePixelHistoryKeys.Num());
+			Root->SetNumberField(TEXT("resourcePixelHistoryQueryLimit"), MaxResourcePixelHistoryQueries);
 			Root->SetNumberField(TEXT("deterministicContextLimit"), MaxDeterministicContextEvents);
 			Root->SetNumberField(TEXT("agentEventChainLimitPerSample"), MaxAgentEventChainPerSample);
 			return SerializeJson(Root);
@@ -751,10 +1184,12 @@ namespace UE::RenderTrail::Private
 					const FBoundResourceEvidence& Input = Context->Inputs[Index];
 					TSharedRef<FJsonObject> Resource = MakeShared<FJsonObject>();
 					Resource->SetStringField(TEXT("name"), Input.Name);
+					Resource->SetStringField(TEXT("shaderBinding"), Input.ShaderBinding);
 					Resource->SetStringField(TEXT("stage"), Input.Stage);
 					Resource->SetStringField(TEXT("access"), Input.Access);
 					Resource->SetNumberField(TEXT("width"), Input.Width);
 					Resource->SetNumberField(TEXT("height"), Input.Height);
+					Resource->SetNumberField(TEXT("samples"), Input.Samples);
 					Inputs.Add(MakeShared<FJsonValueObject>(Resource));
 				}
 				Pipeline->SetArrayField(TEXT("usedInputs"), Inputs);
@@ -772,6 +1207,7 @@ namespace UE::RenderTrail::Private
 				}
 				Pipeline->SetArrayField(TEXT("usedOutputs"), Outputs);
 				Pipeline->SetArrayField(TEXT("resourceProvenance"), Context->ResourceProvenance);
+				Pipeline->SetArrayField(TEXT("resourcePixelHistories"), Context->ResourcePixelHistories);
 				if (Context->PipelineState.IsValid())
 				{
 					Pipeline->SetObjectField(TEXT("fixedFunctionState"), Context->PipelineState);
@@ -880,11 +1316,13 @@ namespace UE::RenderTrail::Private
 			}
 			EnsureRelevantEventContexts();
 			EnsureCandidateShaderDebug();
-			if (PendingEventContextIds.Num() > 0 || PendingShaderDebugByRequest.Num() > 0)
+			if (HasPendingCriticalDeterministicQueries())
 			{
 				bAgentWaitingForDeterministicContexts = true;
-				SetAgentStatus(FString::Printf(TEXT("正在收集确定性溯源上下文（%d 个事件、%d 个 Shader 调试任务待查询）；完成后再进行语义提炼。"),
-					PendingEventContextIds.Num(), PendingShaderDebugByRequest.Num()));
+				SetAgentStatus(FString::Printf(TEXT("正在收集快速确定性前沿（根事件=%d、Shader=%d、必需资源/sample=%d；后台深追=%d）；快速前沿完成后立即进行语义提炼。"),
+					GetPendingCriticalContextCount(),
+					PendingShaderDebugByRequest.Num(), GetPendingRequiredResourceHistoryCount(),
+					GetPendingBackgroundResourceHistoryCount()));
 				return FReply::Handled();
 			}
 
@@ -894,8 +1332,15 @@ namespace UE::RenderTrail::Private
 			bAgentRunning = true;
 			if (AgentRunButtonText.IsValid())
 				AgentRunButtonText->SetText(FText::FromString(TEXT("处理中…")));
-			SetAgentOutputText(TEXT("确定性溯源已完成，Agent 只负责整理已收集的证据。"));
+			SetAgentOutputText(HasPendingBackgroundDeterministicQueries()
+				? TEXT("快速确定性前沿已完成；Agent 正在整理当前证据，后台深层溯源继续更新技术报告。")
+				: TEXT("确定性溯源已完成，Agent 只负责整理已收集的证据。"));
 			const FString PrefilterEvidence = BuildAgentPrefilterEvidence();
+			Diagnostics.WriteRecord(TEXT("agent_evidence_compaction"), FString::Printf(
+				TEXT("chars=%d contextsIncluded=%d contextsTotal=%d pendingCriticalContexts=%d pendingRequiredResources=%d pendingBackgroundResources=%d pendingShader=%d"),
+				PrefilterEvidence.Len(), FMath::Min(EventContexts.Num(), MaxAgentDeterministicContexts), EventContexts.Num(),
+				GetPendingCriticalContextCount(), GetPendingRequiredResourceHistoryCount(),
+				GetPendingBackgroundResourceHistoryCount(), PendingShaderDebugByRequest.Num()));
 			Diagnostics.WriteAgentLog(TEXT("RunStart"), FString::Printf(
 				TEXT("Bounded agent run started. samples=%d, evidenceChars=%d, maxTurns=%d\nPREFILTERED_EVIDENCE\n%s"),
 				Samples.Num(), PrefilterEvidence.Len(), MaxAgentSteps, *PrefilterEvidence), true);
@@ -917,6 +1362,7 @@ namespace UE::RenderTrail::Private
 			}
 			AddAgentMessage(TEXT("user"), UserMessage);
 			SendAgentTurn();
+			ReleaseBackgroundDeterministicQueries();
 			return FReply::Handled();
 		}
 
@@ -1025,6 +1471,10 @@ namespace UE::RenderTrail::Private
 			Diagnostics.WriteAgentLog(TEXT("ModelTurnParsedJson"), FString::Printf(
 				TEXT("finishReason=%s contentChars=%d reasoningChars=%d content=%s"),
 				*Response.FinishReason, Response.Content.Len(), Response.ReasoningContent.Len(), *Response.Content));
+			Diagnostics.WriteRecord(TEXT("agent_completion_phase"), FString::Printf(
+				TEXT("turn=%d finishReason=%s contentChars=%d reasoningChars=%d likelyTruncated=%s"),
+				AgentStep, *Response.FinishReason, Response.Content.Len(), Response.ReasoningContent.Len(),
+				Response.FinishReason.Equals(TEXT("length"), ESearchCase::IgnoreCase) ? TEXT("true") : TEXT("false")));
 			HandleAgentAction(Response.Content, Response.ReasoningContent);
 		}
 
@@ -1153,12 +1603,33 @@ namespace UE::RenderTrail::Private
 			FString Json;
 			TSharedPtr<FJsonObject> Action;
 			bool bRepairedJson = false;
+			FString ParseError;
 			FString ActionName;
-			if (!AgentProtocol::TryParseActionJson(Content, Json, Action, bRepairedJson))
+			if (!AgentProtocol::TryParseActionJson(Content, Json, Action, bRepairedJson, &ParseError))
 			{
+				Diagnostics.WriteAgentLog(TEXT("ModelActionParseFailed"), FString::Printf(
+					TEXT("turn=%d contentChars=%d extractedChars=%d error=%s"),
+					AgentStep, Content.Len(), Json.Len(), *ParseError));
 				if (AgentStep >= MaxAgentSteps)
 				{
-					FinishAgentWithError(TEXT("模型在最终轮没有返回约定 JSON：") + Content.Left(800));
+					TSharedRef<FJsonObject> Fallback = MakeShared<FJsonObject>();
+					Fallback->SetStringField(TEXT("answer"), LastReportSummary.IsEmpty()
+						? TEXT("模型结构化输出无效；已保留 RenderTrail 本地确定性报告。")
+						: LastReportSummary + TEXT(" 模型结构化输出无效，本结果由本地确定性证据回退生成。"));
+					NormalizeAnswerOnlyAgentObject(Fallback);
+					TArray<TSharedPtr<FJsonValue>> Unknowns;
+					Unknowns.Add(MakeShared<FJsonValueString>(FString::Printf(
+						TEXT("模型返回内容无法解析为约定 JSON：%s"), *ParseError.Left(300))));
+					if (HasPendingBackgroundDeterministicQueries())
+					{
+						Unknowns.Add(MakeShared<FJsonValueString>(TEXT("后台深层资源溯源仍在继续；可在完成后再次运行语义整理。")));
+					}
+					Fallback->SetArrayField(TEXT("unknowns"), MoveTemp(Unknowns));
+					Fallback->SetStringField(TEXT("finding"), LastReportSummary.IsEmpty()
+						? TEXT("确定性报告可用；模型结构化整理失败。") : LastReportSummary);
+					Diagnostics.WriteAgentLog(TEXT("ModelActionLocalFallback"),
+						TEXT("Displayed a deterministic local finish object instead of exposing malformed model JSON."));
+					DisplayAgentFinal(Fallback);
 					return;
 				}
 				AddAgentMessage(TEXT("assistant"), Content, ReasoningContent);
@@ -1678,7 +2149,17 @@ namespace UE::RenderTrail::Private
 			{
 				EventContexts.Empty();
 				EventContextDepths.Empty();
+				EventTracePixels.Empty();
 				PendingEventContextByRequest.Empty();
+				PendingResourcePixelHistoryByRequest.Empty();
+				ScheduledResourcePixelHistoryKeys.Empty();
+				ResourcePixelHistoryBindingAliases.Empty();
+				DeferredResourceHistoryContextIds.Empty();
+				DeferredResourceHistoryBranchCounts.Empty();
+				DeferredEventContextIds.Empty();
+				FailedResourcePixelHistoryKeys.Empty();
+				ResourcePixelHistoryQueriesSubmitted = 0;
+				bBackgroundDeterministicQueriesReleased = false;
 				PendingEventContextIds.Empty();
 				FailedEventContextIds.Empty();
 				LastCandidate.Reset();
@@ -1713,6 +2194,7 @@ namespace UE::RenderTrail::Private
 					{
 						Request->SetNumberField(TEXT("x"), Sample.Pixel.X);
 						Request->SetNumberField(TEXT("y"), Sample.Pixel.Y);
+						Request->SetNumberField(TEXT("sample"), 0);
 					});
 				++QueuedCount;
 			}
@@ -1751,6 +2233,21 @@ namespace UE::RenderTrail::Private
 			EventContextDepths.Empty();
 			PendingEventContextByRequest.Empty();
 			PendingShaderDebugByRequest.Empty();
+			PendingResourcePixelHistoryByRequest.Empty();
+			ScheduledResourcePixelHistoryKeys.Empty();
+			ResourcePixelHistoryBindingAliases.Empty();
+			DeferredResourceHistoryContextIds.Empty();
+			DeferredResourceHistoryBranchCounts.Empty();
+			DeferredEventContextIds.Empty();
+			FailedResourcePixelHistoryKeys.Empty();
+			WorkerRequestQueuedSeconds.Empty();
+			WorkerRequestCommands.Empty();
+			ActiveWorkerRequestId.Empty();
+			ActiveWorkerStage.Empty();
+			ActiveWorkerRequestStartSeconds = 0.0;
+			ResourcePixelHistoryQueriesSubmitted = 0;
+			bBackgroundDeterministicQueriesReleased = false;
+			EventTracePixels.Empty();
 			PendingEventContextIds.Empty();
 			FailedEventContextIds.Empty();
 			FailedShaderDebugIds.Empty();
@@ -1877,6 +2374,8 @@ namespace UE::RenderTrail::Private
 			PreviewPath = UE::RenderTrail::GetPreviewPathForCapture(Capture);
 			CaptureLoadStartSeconds = FPlatformTime::Seconds();
 			LastCaptureLoadStatusSeconds = CaptureLoadStartSeconds;
+			LastWorkerHeartbeatSeconds = CaptureLoadStartSeconds;
+			LastWorkerDiagnosticPhase.Empty();
 			bCaptureLoading = true;
 			CaptureLoadPhase = TEXT("Preparing isolated Replay Worker");
 			const int64 CaptureSize = IFileManager::Get().FileSize(*Capture);
@@ -1894,6 +2393,9 @@ namespace UE::RenderTrail::Private
 			}
 			bReplayStartDeferred = false;
 			bWorkerReady = false;
+			ReplayTargetResourceIndex = INDEX_NONE;
+			ReplayTargetSamples = 1;
+			ReplayTargetFormat.Empty();
 			bPreviewReadyForSelection = bPreserveSelection && PreviewBrush.IsValid();
 			LastWorkerError.Empty();
 			FIntPoint NativePreviewSize = FIntPoint::ZeroValue;
@@ -1950,7 +2452,26 @@ namespace UE::RenderTrail::Private
 			{
 				Diagnostics.WriteRecord(TEXT("analyzer_to_worker"), TEXT("{\"command\":\"shutdown\"}"));
 			}
-			ReplayWorker.Stop();
+			const FRenderTrailReplayWorkerStopResult StopResult = ReplayWorker.Stop();
+			const FString StopDetail = FString::Printf(
+				TEXT("hadProcess=%s wasRunning=%s shutdownWritten=%s graceful=%s forced=%s elapsed=%.3fs"),
+				StopResult.bHadProcess ? TEXT("true") : TEXT("false"),
+				StopResult.bWasRunning ? TEXT("true") : TEXT("false"),
+				StopResult.bShutdownWritten ? TEXT("true") : TEXT("false"),
+				StopResult.bExitedGracefully ? TEXT("true") : TEXT("false"),
+				StopResult.bForcedTermination ? TEXT("true") : TEXT("false"), StopResult.ElapsedSeconds);
+			if (Diagnostics.HasSession())
+			{
+				Diagnostics.WriteRecord(TEXT("worker_stop_complete"), StopDetail);
+			}
+			if (StopResult.bForcedTermination)
+			{
+				UE_LOG(LogRenderTrailAnalyzer, Warning, TEXT("Replay Worker stop complete: %s"), *StopDetail);
+			}
+			else
+			{
+				UE_LOG(LogRenderTrailAnalyzer, Display, TEXT("Replay Worker stop complete: %s"), *StopDetail);
+			}
 			bWorkerReady = false;
 			bPreviewReadyForSelection = false;
 		}
@@ -2004,7 +2525,43 @@ namespace UE::RenderTrail::Private
 			{
 				Diagnostics.WriteRecord(TEXT("analyzer_to_worker"), Payload);
 			}
-			return ReplayWorker.Write(Payload);
+			const double QueuedAt = FPlatformTime::Seconds();
+			WorkerRequestQueuedSeconds.Add(RequestId, QueuedAt);
+			WorkerRequestCommands.Add(RequestId, Command);
+			Diagnostics.WriteRecord(TEXT("worker_request_queued"), FString::Printf(
+				TEXT("request=%s command=%s queueOrdinal=%llu pendingTotal=%d critical=%s"),
+				*RequestId, *Command, ++WorkerQueueOrdinal, WorkerRequestQueuedSeconds.Num(),
+				HasPendingCriticalDeterministicQueries() ? TEXT("true") : TEXT("false")));
+			const bool bWritten = ReplayWorker.Write(Payload);
+			if (!bWritten)
+			{
+				WorkerRequestQueuedSeconds.Remove(RequestId);
+				WorkerRequestCommands.Remove(RequestId);
+				Diagnostics.WriteRecord(TEXT("worker_request_queue_failed"), FString::Printf(
+					TEXT("request=%s command=%s"), *RequestId, *Command));
+			}
+			return bWritten;
+		}
+
+		double CompleteWorkerRequest(const FString& RequestId, const FString& ResultType, const FString& Detail = FString())
+		{
+			const double Now = FPlatformTime::Seconds();
+			const double* QueuedAt = WorkerRequestQueuedSeconds.Find(RequestId);
+			const double QueueToResponseSeconds = QueuedAt ? Now - *QueuedAt : -1.0;
+			const FString Command = WorkerRequestCommands.FindRef(RequestId);
+			Diagnostics.WriteRecord(TEXT("worker_request_completed"), FString::Printf(
+				TEXT("request=%s command=%s result=%s queueToResponse=%.3fs remaining=%d detail=%s"),
+				*RequestId, *Command, *ResultType, QueueToResponseSeconds,
+				FMath::Max(0, WorkerRequestQueuedSeconds.Num() - (QueuedAt ? 1 : 0)), *Detail));
+			WorkerRequestQueuedSeconds.Remove(RequestId);
+			WorkerRequestCommands.Remove(RequestId);
+			if (ActiveWorkerRequestId == RequestId)
+			{
+				ActiveWorkerRequestId.Empty();
+				ActiveWorkerStage.Empty();
+				ActiveWorkerRequestStartSeconds = 0.0;
+			}
+			return QueueToResponseSeconds;
 		}
 
 		void ReleasePreview()
@@ -2119,6 +2676,38 @@ namespace UE::RenderTrail::Private
 				Message->TryGetStringField(TEXT("phase"), Phase);
 				Message->TryGetNumberField(TEXT("elapsedSeconds"), WorkerElapsed);
 				SetCaptureLoadPhase(FString::Printf(TEXT("Isolated Replay Worker: %s (%.1fs)"), *Phase, WorkerElapsed));
+				LastWorkerDiagnosticPhase = Phase;
+				return;
+			}
+			if (Type == TEXT("diagnostic"))
+			{
+				FString Stage;
+				FString State;
+				FString Detail;
+				FString RequestId;
+				double StageElapsed = 0.0;
+				Message->TryGetStringField(TEXT("stage"), Stage);
+				Message->TryGetStringField(TEXT("state"), State);
+				Message->TryGetStringField(TEXT("detail"), Detail);
+				Message->TryGetStringField(TEXT("requestId"), RequestId);
+				Message->TryGetNumberField(TEXT("stageElapsedSeconds"), StageElapsed);
+				LastWorkerDiagnosticPhase = FString::Printf(TEXT("%s %s: %s"), *Stage, *State, *Detail);
+				if (!RequestId.IsEmpty())
+				{
+					ActiveWorkerRequestId = RequestId;
+					ActiveWorkerStage = FString::Printf(TEXT("%s %s"), *Stage, *State);
+					if (ActiveWorkerRequestStartSeconds <= 0.0 || State == TEXT("begin"))
+					{
+						ActiveWorkerRequestStartSeconds = WorkerRequestQueuedSeconds.FindRef(RequestId);
+						if (ActiveWorkerRequestStartSeconds <= 0.0)
+						{
+							ActiveWorkerRequestStartSeconds = FPlatformTime::Seconds();
+						}
+					}
+				}
+				UE_LOG(LogRenderTrailAnalyzer, Display,
+					TEXT("Replay Worker diagnostic: stage='%s' state='%s' stageElapsed=%.3fs detail='%s'"),
+					*Stage, *State, StageElapsed, *Detail);
 				return;
 			}
 			if (Type == TEXT("preview"))
@@ -2161,6 +2750,13 @@ namespace UE::RenderTrail::Private
 				const FString Version = Message->GetStringField(TEXT("renderDocVersion"));
 				const bool bPixelHistory = Message->GetBoolField(TEXT("pixelHistorySupported"));
 				const bool bShaderDebug = Message->GetBoolField(TEXT("shaderDebuggingSupported"));
+				double TargetResourceIndexValue = INDEX_NONE;
+				double TargetSamplesValue = 1.0;
+				Message->TryGetNumberField(TEXT("targetResourceIndex"), TargetResourceIndexValue);
+				Message->TryGetNumberField(TEXT("targetSamples"), TargetSamplesValue);
+				Message->TryGetStringField(TEXT("targetFormat"), ReplayTargetFormat);
+				ReplayTargetResourceIndex = static_cast<int32>(TargetResourceIndexValue);
+				ReplayTargetSamples = FMath::Max(1, static_cast<int32>(TargetSamplesValue));
 				const FIntPoint ReplayTargetSize(Width, Height);
 				const bool bSelectionCoordinatesChanged = !Samples.IsEmpty()
 					&& CurrentPreviewSize != FIntPoint::ZeroValue
@@ -2169,9 +2765,10 @@ namespace UE::RenderTrail::Private
 				bool bPreviewCached = false;
 				Message->TryGetBoolField(TEXT("previewCached"), bPreviewCached);
 				UE_LOG(LogRenderTrailAnalyzer, Display,
-					TEXT("Isolated Replay Worker ready: elapsed=%.3fs RenderDoc=%s Size=%dx%d Target='%s' PixelHistory=%s ShaderDebug=%s Preview='%s'"),
+					TEXT("Isolated Replay Worker ready: elapsed=%.3fs RenderDoc=%s Size=%dx%d Target='%s' Resource=%d Samples=%d Format='%s' PixelHistory=%s ShaderDebug=%s Preview='%s'"),
 					bCaptureLoading ? FPlatformTime::Seconds() - CaptureLoadStartSeconds : 0.0,
-					*Version, Width, Height, *Target, bPixelHistory ? TEXT("yes") : TEXT("no"),
+					*Version, Width, Height, *Target, ReplayTargetResourceIndex, ReplayTargetSamples, *ReplayTargetFormat,
+					bPixelHistory ? TEXT("yes") : TEXT("no"),
 					bShaderDebug ? TEXT("yes") : TEXT("no"), *Path);
 				SetCaptureLoadPhase(bPreviewCached
 					? TEXT("Isolated Replay Worker ready; reusing cached preview")
@@ -2224,7 +2821,16 @@ namespace UE::RenderTrail::Private
 			}
 			if (Type == TEXT("pixel_history"))
 			{
-				StorePixelHistory(Message.ToSharedRef());
+				FString RequestId;
+				Message->TryGetStringField(TEXT("requestId"), RequestId);
+				if (PendingResourcePixelHistoryByRequest.Contains(RequestId))
+				{
+					StoreResourcePixelHistory(Message.ToSharedRef());
+				}
+				else
+				{
+					StorePixelHistory(Message.ToSharedRef());
+				}
 				return;
 			}
 			if (Type == TEXT("event_context"))
@@ -2248,7 +2854,8 @@ namespace UE::RenderTrail::Private
 				const bool bKnownRequest = RequestId.IsEmpty()
 					|| PendingSampleByRequest.Contains(RequestId)
 					|| PendingEventContextByRequest.Contains(RequestId)
-					|| PendingShaderDebugByRequest.Contains(RequestId);
+					|| PendingShaderDebugByRequest.Contains(RequestId)
+					|| PendingResourcePixelHistoryByRequest.Contains(RequestId);
 				if (!bKnownRequest)
 				{
 					UE_LOG(LogRenderTrailAnalyzer, Verbose,
@@ -2257,6 +2864,10 @@ namespace UE::RenderTrail::Private
 					return;
 				}
 				LastWorkerError = FString::Printf(TEXT("%s: %s"), *Stage, *Error);
+				if (!RequestId.IsEmpty())
+				{
+					CompleteWorkerRequest(RequestId, TEXT("error"), Stage);
+				}
 				if (bCaptureLoading)
 				{
 					FinishCaptureLoad(FString::Printf(TEXT("worker error: %s"), *Stage));
@@ -2292,6 +2903,28 @@ namespace UE::RenderTrail::Private
 				{
 					FailedShaderDebugIds.Add(*EventId);
 					PendingShaderDebugByRequest.Remove(RequestId);
+					RenderCausalReport();
+					TryResumeAgentAfterDeterministicContexts();
+				}
+				if (const FResourcePixelHistoryRequest* TraceRequest = PendingResourcePixelHistoryByRequest.Find(RequestId))
+				{
+					const FResourcePixelHistoryRequest FailedRequest = *TraceRequest;
+					PendingResourcePixelHistoryByRequest.Remove(RequestId);
+					FailedResourcePixelHistoryKeys.Add(FailedRequest.TraceKey);
+					if (FEventContextEvidence* Context = EventContexts.Find(FailedRequest.ConsumerEventId))
+					{
+						TSharedRef<FJsonObject> Failure = MakeShared<FJsonObject>();
+						Failure->SetNumberField(TEXT("consumerEventId"), FailedRequest.ConsumerEventId);
+						Failure->SetNumberField(TEXT("resourceIndex"), FailedRequest.ResourceIndex);
+						Failure->SetStringField(TEXT("resourceName"), FailedRequest.ResourceName);
+						Failure->SetStringField(TEXT("shaderBinding"), FailedRequest.ShaderBinding);
+						Failure->SetNumberField(TEXT("x"), FailedRequest.Pixel.X);
+						Failure->SetNumberField(TEXT("y"), FailedRequest.Pixel.Y);
+						Failure->SetNumberField(TEXT("sample"), FailedRequest.Sample);
+						Failure->SetStringField(TEXT("branchStatus"), TEXT("query-failed"));
+						Failure->SetStringField(TEXT("error"), Error);
+						Context->ResourcePixelHistories.Add(MakeShared<FJsonValueObject>(Failure));
+					}
 					RenderCausalReport();
 					TryResumeAgentAfterDeterministicContexts();
 				}
@@ -2359,6 +2992,7 @@ namespace UE::RenderTrail::Private
 				// Never attach an old point's context to the new single-pixel session.
 				return;
 			}
+			CompleteWorkerRequest(RequestId, TEXT("event_context"), FString::Printf(TEXT("event=%u"), EventId));
 			PendingEventContextByRequest.Remove(RequestId);
 			PendingEventContextIds.Remove(EventId);
 
@@ -2405,10 +3039,441 @@ namespace UE::RenderTrail::Private
 				Context.ResourceProvenance = *Provenance;
 			}
 			EventContexts.Add(EventId, MoveTemp(Context));
+			const FEventContextEvidence& StoredContext = EventContexts.FindChecked(EventId);
+			Diagnostics.WriteRecord(TEXT("event_context_completed"), FString::Printf(
+				TEXT("request=%s event=%u depth=%d critical=%s inputs=%d outputs=%d provenance=%d pipeline=%s"),
+				*RequestId, EventId, EventContextDepths.FindRef(EventId),
+				IsCriticalAgentEvent(EventId) ? TEXT("true") : TEXT("false"),
+				StoredContext.Inputs.Num(), StoredContext.Outputs.Num(), StoredContext.ResourceProvenance.Num(),
+				StoredContext.PipelineState.IsValid() ? TEXT("available") : TEXT("unavailable")));
+			ScheduleResourcePixelHistories(EventContexts.FindChecked(EventId));
 			ScheduleProducerEventContexts(EventContexts.FindChecked(EventId));
 			RenderCausalReport();
 			ResumeAgentAfterEventContext(EventId);
 			SetStatus(FString::Printf(TEXT("Event %u 的 Pipeline、资源绑定和 Shader 反射已加载；详细内容可展开查看。"), EventId));
+			TryResumeAgentAfterDeterministicContexts();
+		}
+
+		void AddResourceTraceBoundary(FEventContextEvidence& Context, const FResourcePixelHistoryRequest& TraceRequest,
+			const FString& Status, const FString& Detail)
+		{
+			TSharedRef<FJsonObject> Boundary = MakeShared<FJsonObject>();
+			Boundary->SetNumberField(TEXT("consumerEventId"), TraceRequest.ConsumerEventId);
+			Boundary->SetNumberField(TEXT("resourceIndex"), TraceRequest.ResourceIndex);
+			Boundary->SetStringField(TEXT("resourceName"), TraceRequest.ResourceName);
+			Boundary->SetStringField(TEXT("shaderBinding"), TraceRequest.ShaderBinding);
+			Boundary->SetNumberField(TEXT("x"), TraceRequest.Pixel.X);
+			Boundary->SetNumberField(TEXT("y"), TraceRequest.Pixel.Y);
+			Boundary->SetNumberField(TEXT("mip"), TraceRequest.Mip);
+			Boundary->SetNumberField(TEXT("slice"), TraceRequest.Slice);
+			Boundary->SetNumberField(TEXT("sample"), TraceRequest.Sample);
+			Boundary->SetStringField(TEXT("coordinateMapping"), TraceRequest.Mapping);
+			Boundary->SetStringField(TEXT("mappingConfidence"), TraceRequest.MappingConfidence);
+			Boundary->SetStringField(TEXT("branchStatus"), Status);
+			Boundary->SetStringField(TEXT("detail"), Detail);
+			Context.ResourcePixelHistories.Add(MakeShared<FJsonValueObject>(Boundary));
+		}
+
+		void ScheduleResourcePixelHistories(const FEventContextEvidence& ReadOnlyContext)
+		{
+			if (!bWorkerReady || ReadOnlyContext.Inputs.IsEmpty())
+			{
+				return;
+			}
+			FEventContextEvidence* MutableContext = EventContexts.Find(ReadOnlyContext.EventId);
+			if (!MutableContext)
+			{
+				return;
+			}
+
+			FIntPoint ConsumerPixel = EventTracePixels.FindRef(ReadOnlyContext.EventId);
+			if (ConsumerPixel == FIntPoint::ZeroValue && !Samples.IsEmpty())
+			{
+				ConsumerPixel = Samples[0].Pixel;
+			}
+			FIntPoint OutputExtent = CurrentPreviewSize;
+			for (const FBoundResourceEvidence& Output : ReadOnlyContext.Outputs)
+			{
+				if (Output.bTexture && Output.Width > 0 && Output.Height > 0)
+				{
+					OutputExtent = FIntPoint(Output.Width, Output.Height);
+					break;
+				}
+			}
+
+			const int32 ReverseDepth = EventContextDepths.FindRef(ReadOnlyContext.EventId);
+			TArray<FResourcePixelHistoryRequest> FastFrontier;
+			TArray<FResourcePixelHistoryRequest> BackgroundFrontier;
+			Diagnostics.WriteRecord(TEXT("trace_schedule_begin"), FString::Printf(
+				TEXT("event=%u depth=%d inputs=%d outputExtent=%dx%d consumerPixel=(%d,%d) submitted=%d/%d"),
+				ReadOnlyContext.EventId, ReverseDepth, ReadOnlyContext.Inputs.Num(), OutputExtent.X, OutputExtent.Y,
+				ConsumerPixel.X, ConsumerPixel.Y, ResourcePixelHistoryQueriesSubmitted, MaxResourcePixelHistoryQueries));
+
+			for (const FBoundResourceEvidence& Input : ReadOnlyContext.Inputs)
+			{
+				if (!Input.bTexture || Input.ResourceIndex == INDEX_NONE || Input.Width <= 0 || Input.Height <= 0)
+				{
+					continue;
+				}
+
+				FIntPoint InputPixel = ConsumerPixel;
+				FString Mapping = TEXT("same-coordinate");
+				FString MappingConfidence = TEXT("same-extent");
+				if (OutputExtent.X != Input.Width || OutputExtent.Y != Input.Height)
+				{
+					if (FMath::Abs(OutputExtent.X - Input.Width) <= 1 && FMath::Abs(OutputExtent.Y - Input.Height) <= 1)
+					{
+						Mapping = TEXT("same-coordinate-near-extent-candidate");
+						MappingConfidence = TEXT("candidate");
+					}
+					else if (OutputExtent.X > 0 && OutputExtent.Y > 0)
+					{
+						InputPixel.X = FMath::FloorToInt((static_cast<double>(ConsumerPixel.X) + 0.5)
+							* static_cast<double>(Input.Width) / static_cast<double>(OutputExtent.X));
+						InputPixel.Y = FMath::FloorToInt((static_cast<double>(ConsumerPixel.Y) + 0.5)
+							* static_cast<double>(Input.Height) / static_cast<double>(OutputExtent.Y));
+						Mapping = TEXT("normalized-pixel-center-candidate");
+						MappingConfidence = TEXT("candidate");
+					}
+				}
+				InputPixel.X = FMath::Clamp(InputPixel.X, 0, Input.Width - 1);
+				InputPixel.Y = FMath::Clamp(InputPixel.Y, 0, Input.Height - 1);
+
+				const int32 AvailableSamples = FMath::Max(1, Input.Samples);
+				const int32 SamplesToTrace = FMath::Min(AvailableSamples, MaxSamplesPerResourceTrace);
+				for (int32 SampleIndex = 0; SampleIndex < SamplesToTrace; ++SampleIndex)
+				{
+					FResourcePixelHistoryRequest TraceRequest;
+					TraceRequest.ConsumerEventId = ReadOnlyContext.EventId;
+					TraceRequest.ResourceIndex = Input.ResourceIndex;
+					TraceRequest.ResourceName = Input.Name;
+					TraceRequest.ShaderBinding = Input.ShaderBinding;
+					TraceRequest.Mapping = Mapping;
+					TraceRequest.MappingConfidence = MappingConfidence;
+					TraceRequest.Pixel = InputPixel;
+					TraceRequest.Mip = Input.FirstMip;
+					TraceRequest.Slice = Input.FirstSlice;
+					TraceRequest.Sample = SampleIndex;
+					TraceRequest.TypeCast = Input.TypeCast;
+					TraceRequest.ReverseDepth = ReverseDepth;
+					TraceRequest.bRequiredForAgent = IsCriticalAgentEvent(ReadOnlyContext.EventId)
+						&& SampleIndex == 0;
+					TraceRequest.TraceKey = FString::Printf(TEXT("%u:%d:%d:%d:%d:%d:%d:%d"),
+						TraceRequest.ConsumerEventId, TraceRequest.ResourceIndex, TraceRequest.Pixel.X, TraceRequest.Pixel.Y,
+						TraceRequest.Mip, TraceRequest.Slice, TraceRequest.Sample, TraceRequest.TypeCast);
+					(SampleIndex == 0 ? FastFrontier : BackgroundFrontier).Add(MoveTemp(TraceRequest));
+				}
+
+				if (AvailableSamples > SamplesToTrace)
+				{
+					FResourcePixelHistoryRequest Boundary;
+					Boundary.ConsumerEventId = ReadOnlyContext.EventId;
+					Boundary.ResourceIndex = Input.ResourceIndex;
+					Boundary.ResourceName = Input.Name;
+					Boundary.ShaderBinding = Input.ShaderBinding;
+					Boundary.Pixel = InputPixel;
+					Boundary.Mip = Input.FirstMip;
+					Boundary.Slice = Input.FirstSlice;
+					Boundary.Sample = SamplesToTrace;
+					Boundary.Mapping = Mapping;
+					Boundary.MappingConfidence = MappingConfidence;
+					AddResourceTraceBoundary(*MutableContext, Boundary, TEXT("sample-limit"),
+						FString::Printf(TEXT("%d samples exist; only the first %d were queried."), AvailableSamples, SamplesToTrace));
+				}
+			}
+
+			auto ScheduleTrace = [this, MutableContext](const FResourcePixelHistoryRequest& TraceRequest)
+			{
+				if (ScheduledResourcePixelHistoryKeys.Contains(TraceRequest.TraceKey))
+				{
+					ResourcePixelHistoryBindingAliases.FindOrAdd(TraceRequest.TraceKey).AddUnique(TraceRequest.ShaderBinding);
+					Diagnostics.WriteRecord(TEXT("trace_branch_deduplicated"), FString::Printf(
+						TEXT("key=%s consumer=%u resource=%d binding=%s sample=%d"), *TraceRequest.TraceKey,
+						TraceRequest.ConsumerEventId, TraceRequest.ResourceIndex, *TraceRequest.ShaderBinding, TraceRequest.Sample));
+					return;
+				}
+				ScheduledResourcePixelHistoryKeys.Add(TraceRequest.TraceKey);
+				ResourcePixelHistoryBindingAliases.FindOrAdd(TraceRequest.TraceKey).AddUnique(TraceRequest.ShaderBinding);
+				if (ResourcePixelHistoryQueriesSubmitted >= MaxResourcePixelHistoryQueries)
+				{
+					AddResourceTraceBoundary(*MutableContext, TraceRequest, TEXT("query-budget-exhausted"),
+						TEXT("The sample branch is recorded but was not queried because the bounded replay budget was reached."));
+					Diagnostics.WriteRecord(TEXT("trace_branch_budget"), FString::Printf(
+						TEXT("key=%s submitted=%d limit=%d"), *TraceRequest.TraceKey,
+						ResourcePixelHistoryQueriesSubmitted, MaxResourcePixelHistoryQueries));
+					return;
+				}
+				++ResourcePixelHistoryQueriesSubmitted;
+				const FString RequestId = FString::Printf(TEXT("resource-pixel-%u-%d-s%d-query-%llu"),
+					TraceRequest.ConsumerEventId, TraceRequest.ResourceIndex, TraceRequest.Sample, ++RequestSerial);
+				PendingResourcePixelHistoryByRequest.Add(RequestId, TraceRequest);
+				Diagnostics.WriteRecord(TEXT("trace_branch_queued"), FString::Printf(
+					TEXT("request=%s required=%s depth=%d key=%s resource=%s binding=%s pixel=(%d,%d) sample=%d pending=%d"),
+					*RequestId, TraceRequest.bRequiredForAgent ? TEXT("true") : TEXT("false"), TraceRequest.ReverseDepth,
+					*TraceRequest.TraceKey, *TraceRequest.ResourceName, *TraceRequest.ShaderBinding,
+					TraceRequest.Pixel.X, TraceRequest.Pixel.Y, TraceRequest.Sample,
+					PendingResourcePixelHistoryByRequest.Num()));
+				if (!SendWorkerRequest(TEXT("pixel_history"), RequestId,
+					[TraceRequest](const TSharedRef<FJsonObject>& Request)
+					{
+						Request->SetNumberField(TEXT("x"), TraceRequest.Pixel.X);
+						Request->SetNumberField(TEXT("y"), TraceRequest.Pixel.Y);
+						Request->SetNumberField(TEXT("resourceIndex"), TraceRequest.ResourceIndex);
+						Request->SetNumberField(TEXT("mip"), TraceRequest.Mip);
+						Request->SetNumberField(TEXT("slice"), TraceRequest.Slice);
+						Request->SetNumberField(TEXT("sample"), TraceRequest.Sample);
+						Request->SetNumberField(TEXT("beforeEventId"), TraceRequest.ConsumerEventId);
+						if (TraceRequest.TypeCast != INDEX_NONE)
+						{
+							Request->SetNumberField(TEXT("typeCast"), TraceRequest.TypeCast);
+						}
+					}))
+				{
+					PendingResourcePixelHistoryByRequest.Remove(RequestId);
+					FailedResourcePixelHistoryKeys.Add(TraceRequest.TraceKey);
+					AddResourceTraceBoundary(*MutableContext, TraceRequest, TEXT("queue-failed"),
+						TEXT("Replay Worker request could not be queued."));
+				}
+			};
+
+			for (const FResourcePixelHistoryRequest& TraceRequest : FastFrontier)
+			{
+				ScheduleTrace(TraceRequest);
+			}
+			if (bBackgroundDeterministicQueriesReleased)
+			{
+				for (const FResourcePixelHistoryRequest& TraceRequest : BackgroundFrontier)
+				{
+					ScheduleTrace(TraceRequest);
+				}
+			}
+			else if (!BackgroundFrontier.IsEmpty())
+			{
+				DeferredResourceHistoryContextIds.Add(ReadOnlyContext.EventId);
+				DeferredResourceHistoryBranchCounts.Add(ReadOnlyContext.EventId, BackgroundFrontier.Num());
+				Diagnostics.WriteRecord(TEXT("trace_background_deferred"), FString::Printf(
+					TEXT("event=%u depth=%d branches=%d pendingCriticalContexts=%d pendingRequired=%d"),
+					ReadOnlyContext.EventId, ReverseDepth, BackgroundFrontier.Num(),
+					GetPendingCriticalContextCount(), GetPendingRequiredResourceHistoryCount()));
+			}
+			Diagnostics.WriteRecord(TEXT("trace_schedule_end"), FString::Printf(
+				TEXT("event=%u depth=%d fast=%d background=%d backgroundDeferred=%s pendingRequired=%d pendingBackground=%d submitted=%d/%d"),
+				ReadOnlyContext.EventId, ReverseDepth, FastFrontier.Num(), BackgroundFrontier.Num(),
+				(!bBackgroundDeterministicQueriesReleased && !BackgroundFrontier.IsEmpty()) ? TEXT("true") : TEXT("false"),
+				GetPendingRequiredResourceHistoryCount(), GetPendingBackgroundResourceHistoryCount(),
+				ResourcePixelHistoryQueriesSubmitted, MaxResourcePixelHistoryQueries));
+		}
+
+		void EnrichResourcePixelHistoryFromShaderTrace(const FEventContextEvidence& Context,
+			const TSharedRef<FJsonObject>& Evidence) const
+		{
+			if (!Context.ShaderDebugTrace.IsValid())
+			{
+				return;
+			}
+			FString ShaderBinding;
+			double X = 0.0;
+			double Y = 0.0;
+			double SampleIndex = 0.0;
+			Evidence->TryGetStringField(TEXT("shaderBinding"), ShaderBinding);
+			Evidence->TryGetNumberField(TEXT("x"), X);
+			Evidence->TryGetNumberField(TEXT("y"), Y);
+			Evidence->TryGetNumberField(TEXT("sample"), SampleIndex);
+			if (ShaderBinding.IsEmpty())
+			{
+				return;
+			}
+			bool bMultisampledBinding = false;
+			for (const FBoundResourceEvidence& Input : Context.Inputs)
+			{
+				if (Input.ShaderBinding == ShaderBinding)
+				{
+					bMultisampledBinding = Input.Samples > 1;
+					break;
+				}
+			}
+
+			const TArray<TSharedPtr<FJsonValue>>* TextureAccesses = nullptr;
+			if (!Context.ShaderDebugTrace->TryGetArrayField(TEXT("textureAccesses"), TextureAccesses) || !TextureAccesses)
+			{
+				return;
+			}
+			for (const TSharedPtr<FJsonValue>& AccessValue : *TextureAccesses)
+			{
+				const TSharedPtr<FJsonObject> Access = AccessValue.IsValid() ? AccessValue->AsObject() : nullptr;
+				if (!Access.IsValid())
+				{
+					continue;
+				}
+				FString Disassembly;
+				Access->TryGetStringField(TEXT("disassembly"), Disassembly);
+				if (!Disassembly.Contains(ShaderBinding, ESearchCase::CaseSensitive))
+				{
+					continue;
+				}
+				if (bMultisampledBinding && !Disassembly.Contains(
+					FString::Printf(TEXT("SampleIndex = %d"), static_cast<int32>(SampleIndex)), ESearchCase::CaseSensitive))
+				{
+					continue;
+				}
+
+				bool bSawX = false;
+				bool bSawY = false;
+				const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+				if (Access->TryGetArrayField(TEXT("variables"), Variables) && Variables)
+				{
+					for (const TSharedPtr<FJsonValue>& VariableValue : *Variables)
+					{
+						const TSharedPtr<FJsonObject> Variable = VariableValue.IsValid() ? VariableValue->AsObject() : nullptr;
+						const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+						if (!Variable.IsValid() || !Variable->TryGetArrayField(TEXT("values"), Values) || !Values)
+						{
+							continue;
+						}
+						for (const TSharedPtr<FJsonValue>& Value : *Values)
+						{
+							if (!Value.IsValid() || Value->Type != EJson::Number)
+							{
+								continue;
+							}
+							const double Number = Value->AsNumber();
+							bSawX |= FMath::IsNearlyEqual(Number, X);
+							bSawY |= FMath::IsNearlyEqual(Number, Y);
+						}
+					}
+				}
+				Evidence->SetBoolField(TEXT("shaderAccessObserved"), true);
+				Evidence->SetStringField(TEXT("shaderAccessDisassembly"), Disassembly);
+				double Instruction = 0.0;
+				if (Access->TryGetNumberField(TEXT("instruction"), Instruction))
+				{
+					Evidence->SetNumberField(TEXT("shaderAccessInstruction"), Instruction);
+				}
+				Evidence->SetBoolField(TEXT("shaderCoordinateValuesMatched"), bSawX && bSawY);
+				if (bSawX && bSawY)
+				{
+					Evidence->SetStringField(TEXT("coordinateMapping"), TEXT("executed-shader-load-coordinate"));
+					Evidence->SetStringField(TEXT("mappingConfidence"), TEXT("confirmed-executed-values"));
+				}
+				return;
+			}
+		}
+
+		void StoreResourcePixelHistory(const TSharedRef<FJsonObject>& Message)
+		{
+			FString RequestId;
+			Message->TryGetStringField(TEXT("requestId"), RequestId);
+			const FResourcePixelHistoryRequest* PendingRequest = PendingResourcePixelHistoryByRequest.Find(RequestId);
+			if (!PendingRequest)
+			{
+				return;
+			}
+			const FResourcePixelHistoryRequest TraceRequest = *PendingRequest;
+			const double QueueToResponseSeconds = CompleteWorkerRequest(RequestId, TEXT("resource_pixel_history"),
+				FString::Printf(TEXT("consumer=%u resource=%d sample=%d required=%s"),
+					TraceRequest.ConsumerEventId, TraceRequest.ResourceIndex, TraceRequest.Sample,
+					TraceRequest.bRequiredForAgent ? TEXT("true") : TEXT("false")));
+			PendingResourcePixelHistoryByRequest.Remove(RequestId);
+			FEventContextEvidence* Context = EventContexts.Find(TraceRequest.ConsumerEventId);
+			if (!Context)
+			{
+				TryResumeAgentAfterDeterministicContexts();
+				return;
+			}
+
+			TSharedRef<FJsonObject> Evidence = MakeShared<FJsonObject>();
+			Evidence->SetNumberField(TEXT("consumerEventId"), TraceRequest.ConsumerEventId);
+			Evidence->SetNumberField(TEXT("resourceIndex"), TraceRequest.ResourceIndex);
+			Evidence->SetStringField(TEXT("resourceName"), TraceRequest.ResourceName);
+			Evidence->SetStringField(TEXT("shaderBinding"), TraceRequest.ShaderBinding);
+			Evidence->SetNumberField(TEXT("x"), TraceRequest.Pixel.X);
+			Evidence->SetNumberField(TEXT("y"), TraceRequest.Pixel.Y);
+			Evidence->SetNumberField(TEXT("mip"), TraceRequest.Mip);
+			Evidence->SetNumberField(TEXT("slice"), TraceRequest.Slice);
+			Evidence->SetNumberField(TEXT("sample"), TraceRequest.Sample);
+			Evidence->SetStringField(TEXT("coordinateMapping"), TraceRequest.Mapping);
+			Evidence->SetStringField(TEXT("mappingConfidence"), TraceRequest.MappingConfidence);
+			Evidence->SetBoolField(TEXT("requiredForAgent"), TraceRequest.bRequiredForAgent);
+			Evidence->SetNumberField(TEXT("queueToResponseSeconds"), QueueToResponseSeconds);
+			TArray<TSharedPtr<FJsonValue>> BindingAliases;
+			if (const TArray<FString>* Aliases = ResourcePixelHistoryBindingAliases.Find(TraceRequest.TraceKey))
+			{
+				for (const FString& Alias : *Aliases)
+				{
+					BindingAliases.Add(MakeShared<FJsonValueString>(Alias));
+				}
+			}
+			Evidence->SetArrayField(TEXT("shaderBindingAliases"), MoveTemp(BindingAliases));
+			double TotalModifications = 0.0;
+			double TotalEvents = 0.0;
+			bool bTruncated = false;
+			Message->TryGetNumberField(TEXT("totalModifications"), TotalModifications);
+			Message->TryGetNumberField(TEXT("totalEvents"), TotalEvents);
+			Message->TryGetBoolField(TEXT("truncated"), bTruncated);
+			Evidence->SetNumberField(TEXT("totalModifications"), TotalModifications);
+			Evidence->SetNumberField(TEXT("totalEvents"), TotalEvents);
+			Evidence->SetBoolField(TEXT("detailTailTruncated"), bTruncated);
+
+			TArray<TSharedPtr<FJsonValue>> ConfirmedWriterIds;
+			const TArray<TSharedPtr<FJsonValue>>* EventSummaries = nullptr;
+			int32 ExpandedWriterCount = 0;
+			int32 ConfirmedWriterCount = 0;
+			if (Message->TryGetArrayField(TEXT("eventSummaries"), EventSummaries) && EventSummaries)
+			{
+				Evidence->SetArrayField(TEXT("eventSummaries"), *EventSummaries);
+				for (int32 Index = EventSummaries->Num() - 1; Index >= 0; --Index)
+				{
+					const TSharedPtr<FJsonObject> Summary = (*EventSummaries)[Index].IsValid()
+						? (*EventSummaries)[Index]->AsObject() : nullptr;
+					if (!Summary.IsValid())
+					{
+						continue;
+					}
+					double EventIdValue = 0.0;
+					double PassedFragments = 0.0;
+					bool bChangedTextureValue = false;
+					Summary->TryGetNumberField(TEXT("eventId"), EventIdValue);
+					Summary->TryGetNumberField(TEXT("passedFragments"), PassedFragments);
+					Summary->TryGetBoolField(TEXT("changedTextureValue"), bChangedTextureValue);
+					const uint32 WriterEventId = static_cast<uint32>(EventIdValue);
+					if (WriterEventId == 0 || WriterEventId == TraceRequest.ConsumerEventId
+						|| (PassedFragments <= 0.0 && !bChangedTextureValue))
+					{
+						continue;
+					}
+					++ConfirmedWriterCount;
+					ConfirmedWriterIds.Add(MakeShared<FJsonValueNumber>(WriterEventId));
+					EventTracePixels.FindOrAdd(WriterEventId, TraceRequest.Pixel);
+					if (ExpandedWriterCount < MaxWriterContextsPerResourceTrace)
+					{
+						EnsureEventContext(WriterEventId, TraceRequest.ReverseDepth + 1);
+						++ExpandedWriterCount;
+					}
+				}
+			}
+			Evidence->SetArrayField(TEXT("confirmedWriterEventIds"), MoveTemp(ConfirmedWriterIds));
+			if (ConfirmedWriterCount == 0)
+			{
+				Evidence->SetStringField(TEXT("branchStatus"), TEXT("no-modification-before-consumer"));
+			}
+			else if (ConfirmedWriterCount > ExpandedWriterCount)
+			{
+				Evidence->SetStringField(TEXT("branchStatus"), TEXT("writer-context-limit"));
+				Evidence->SetStringField(TEXT("detail"), FString::Printf(TEXT("%d pixel writers found; %d latest writer contexts expanded."),
+					ConfirmedWriterCount, ExpandedWriterCount));
+			}
+			else
+			{
+				Evidence->SetStringField(TEXT("branchStatus"), TEXT("continued-to-pixel-writer"));
+			}
+			EnrichResourcePixelHistoryFromShaderTrace(*Context, Evidence);
+			Context->ResourcePixelHistories.Add(MakeShared<FJsonValueObject>(Evidence));
+			Diagnostics.WriteRecord(TEXT("trace_branch_completed"), FString::Printf(
+				TEXT("request=%s key=%s required=%s queueToResponse=%.3fs events=%d writers=%d expanded=%d pendingRequired=%d pendingBackground=%d"),
+				*RequestId, *TraceRequest.TraceKey, TraceRequest.bRequiredForAgent ? TEXT("true") : TEXT("false"),
+				QueueToResponseSeconds, static_cast<int32>(TotalEvents), ConfirmedWriterCount, ExpandedWriterCount,
+				GetPendingRequiredResourceHistoryCount(), GetPendingBackgroundResourceHistoryCount()));
+			RenderCausalReport();
 			TryResumeAgentAfterDeterministicContexts();
 		}
 
@@ -2422,11 +3487,23 @@ namespace UE::RenderTrail::Private
 			{
 				return;
 			}
+			CompleteWorkerRequest(RequestId, TEXT("shader_debug"), FString::Printf(TEXT("event=%u"), EventId));
 			PendingShaderDebugByRequest.Remove(RequestId);
 			FEventContextEvidence& Context = EventContexts.FindOrAdd(EventId);
 			Context.EventId = EventId;
 			Context.ShaderDebugTrace = Message;
+			for (const TSharedPtr<FJsonValue>& HistoryValue : Context.ResourcePixelHistories)
+			{
+				const TSharedPtr<FJsonObject> History = HistoryValue.IsValid() ? HistoryValue->AsObject() : nullptr;
+				if (History.IsValid())
+				{
+					EnrichResourcePixelHistoryFromShaderTrace(Context, History.ToSharedRef());
+				}
+			}
 			FailedShaderDebugIds.Remove(EventId);
+			Diagnostics.WriteRecord(TEXT("shader_debug_completed"), FString::Printf(
+				TEXT("request=%s event=%u histories=%d"),
+				*RequestId, EventId, Context.ResourcePixelHistories.Num()));
 			RenderCausalReport();
 			SetStatus(FString::Printf(TEXT("EID %u 的 Pixel Shader 指令追踪已加载；详细证据已更新。"), EventId));
 			TryResumeAgentAfterDeterministicContexts();
@@ -2447,18 +3524,82 @@ namespace UE::RenderTrail::Private
 				EventContextDepths.Add(EventId, ReverseDepth);
 			}
 			if (EventContexts.Contains(EventId) || PendingEventContextIds.Contains(EventId)
-				|| EventContexts.Num() + PendingEventContextIds.Num() >= MaxDeterministicContextEvents)
+				|| DeferredEventContextIds.Contains(EventId))
 			{
+				return;
+			}
+			if (EventContexts.Num() + PendingEventContextIds.Num() + DeferredEventContextIds.Num()
+				>= MaxDeterministicContextEvents)
+			{
+				Diagnostics.WriteRecord(TEXT("event_context_skipped"), FString::Printf(
+					TEXT("event=%u depth=%d reason=context-limit limit=%d"),
+					EventId, ReverseDepth, MaxDeterministicContextEvents));
+				return;
+			}
+			if (!IsCriticalAgentEvent(EventId) && !bBackgroundDeterministicQueriesReleased)
+			{
+				DeferredEventContextIds.Add(EventId);
+				Diagnostics.WriteRecord(TEXT("event_context_deferred"), FString::Printf(
+					TEXT("event=%u depth=%d pendingCritical=%d"),
+					EventId, ReverseDepth, GetPendingCriticalContextCount()));
 				return;
 			}
 			const FString RequestId = FString::Printf(TEXT("context-%u-query-%llu"), EventId, ++RequestSerial);
 			PendingEventContextByRequest.Add(RequestId, EventId);
 			PendingEventContextIds.Add(EventId);
-			SendWorkerRequest(TEXT("event_context"), RequestId,
+			Diagnostics.WriteRecord(TEXT("event_context_queued"), FString::Printf(
+				TEXT("request=%s event=%u depth=%d critical=%s pending=%d"),
+				*RequestId, EventId, ReverseDepth, IsCriticalAgentEvent(EventId) ? TEXT("true") : TEXT("false"),
+				PendingEventContextIds.Num()));
+			if (!SendWorkerRequest(TEXT("event_context"), RequestId,
 				[EventId](const TSharedRef<FJsonObject>& Request)
 				{
 					Request->SetNumberField(TEXT("eventId"), EventId);
-				});
+				}))
+			{
+				PendingEventContextByRequest.Remove(RequestId);
+				PendingEventContextIds.Remove(EventId);
+				FailedEventContextIds.Add(EventId);
+			}
+		}
+
+		void ReleaseBackgroundDeterministicQueries()
+		{
+			if (bBackgroundDeterministicQueriesReleased || HasPendingCriticalDeterministicQueries())
+			{
+				return;
+			}
+			bBackgroundDeterministicQueriesReleased = true;
+			Diagnostics.WriteRecord(TEXT("background_trace_release_begin"), FString::Printf(
+				TEXT("resourceContexts=%d eventContexts=%d"),
+				DeferredResourceHistoryContextIds.Num(), DeferredEventContextIds.Num()));
+
+			TArray<uint32> ResourceContextIds = DeferredResourceHistoryContextIds.Array();
+			DeferredResourceHistoryContextIds.Empty();
+			DeferredResourceHistoryBranchCounts.Empty();
+			for (const uint32 EventId : ResourceContextIds)
+			{
+				if (const FEventContextEvidence* Context = EventContexts.Find(EventId))
+				{
+					ScheduleResourcePixelHistories(*Context);
+				}
+			}
+
+			TArray<uint32> EventIds = DeferredEventContextIds.Array();
+			DeferredEventContextIds.Empty();
+			EventIds.Sort([this](uint32 A, uint32 B)
+			{
+				const int32 DepthA = EventContextDepths.FindRef(A);
+				const int32 DepthB = EventContextDepths.FindRef(B);
+				return DepthA == DepthB ? A > B : DepthA < DepthB;
+			});
+			for (const uint32 EventId : EventIds)
+			{
+				EnsureEventContext(EventId, EventContextDepths.FindRef(EventId));
+			}
+			Diagnostics.WriteRecord(TEXT("background_trace_release_end"), FString::Printf(
+				TEXT("pendingBackgroundResources=%d pendingEventContexts=%d"),
+				GetPendingBackgroundResourceHistoryCount(), PendingEventContextIds.Num()));
 		}
 
 		void ScheduleProducerEventContexts(const FEventContextEvidence& Context)
@@ -2484,11 +3625,45 @@ namespace UE::RenderTrail::Private
 				}
 				bool bProducerFound = false;
 				FString ProducerStatus;
+				FString ShaderBinding;
+				double ResourceIndex = INDEX_NONE;
 				double ProducerEventId = 0.0;
 				Provenance->TryGetBoolField(TEXT("producerFound"), bProducerFound);
 				Provenance->TryGetStringField(TEXT("producerStatus"), ProducerStatus);
+				Provenance->TryGetStringField(TEXT("shaderBinding"), ShaderBinding);
+				Provenance->TryGetNumberField(TEXT("resourceIndex"), ResourceIndex);
 				Provenance->TryGetNumberField(TEXT("producerEventId"), ProducerEventId);
 				if (!bProducerFound || ProducerStatus != TEXT("confirmed-resource-write") || ProducerEventId <= 0.0)
+				{
+					continue;
+				}
+				bool bPixelBranchPending = false;
+				for (const TPair<FString, FResourcePixelHistoryRequest>& Pair : PendingResourcePixelHistoryByRequest)
+				{
+					if (Pair.Value.ConsumerEventId == Context.EventId
+						&& Pair.Value.ResourceIndex == static_cast<int32>(ResourceIndex)
+						&& (ShaderBinding.IsEmpty() || Pair.Value.ShaderBinding == ShaderBinding))
+					{
+						bPixelBranchPending = true;
+						break;
+					}
+				}
+				const bool bPixelBranchRecorded = Context.ResourcePixelHistories.ContainsByPredicate(
+					[ResourceIndex, &ShaderBinding](const TSharedPtr<FJsonValue>& Value)
+					{
+						const TSharedPtr<FJsonObject> History = Value.IsValid() ? Value->AsObject() : nullptr;
+						if (!History.IsValid())
+						{
+							return false;
+						}
+						double HistoryResourceIndex = INDEX_NONE;
+						FString HistoryBinding;
+						History->TryGetNumberField(TEXT("resourceIndex"), HistoryResourceIndex);
+						History->TryGetStringField(TEXT("shaderBinding"), HistoryBinding);
+						return static_cast<int32>(HistoryResourceIndex) == static_cast<int32>(ResourceIndex)
+							&& (ShaderBinding.IsEmpty() || HistoryBinding == ShaderBinding);
+					});
+				if (bPixelBranchPending || bPixelBranchRecorded)
 				{
 					continue;
 				}
@@ -2611,25 +3786,35 @@ namespace UE::RenderTrail::Private
 
 				const FString RequestId = FString::Printf(TEXT("shader-debug-%u-query-%llu"), Candidate.EventId, ++RequestSerial);
 				PendingShaderDebugByRequest.Add(RequestId, Candidate.EventId);
-				SendWorkerRequest(TEXT("shader_debug"), RequestId,
+				Diagnostics.WriteRecord(TEXT("shader_debug_queued"), FString::Printf(
+					TEXT("request=%s event=%u pixel=(%d,%d) primitive=%u hasPrimitive=%s"),
+					*RequestId, Candidate.EventId, SourceSample->Pixel.X, SourceSample->Pixel.Y,
+					Candidate.PrimitiveId, Candidate.bHasPrimitiveEvidence ? TEXT("true") : TEXT("false")));
+				if (!SendWorkerRequest(TEXT("shader_debug"), RequestId,
 					[Candidate, SourceSample](const TSharedRef<FJsonObject>& Request)
 					{
 						Request->SetNumberField(TEXT("eventId"), Candidate.EventId);
 						Request->SetNumberField(TEXT("x"), SourceSample->Pixel.X);
 						Request->SetNumberField(TEXT("y"), SourceSample->Pixel.Y);
+						Request->SetNumberField(TEXT("sample"), 0);
 						Request->SetNumberField(TEXT("primitiveId"), Candidate.PrimitiveId);
 						Request->SetBoolField(TEXT("hasPrimitive"), Candidate.bHasPrimitiveEvidence);
-					});
+					}))
+				{
+					PendingShaderDebugByRequest.Remove(RequestId);
+					FailedShaderDebugIds.Add(Candidate.EventId);
+				}
 			}
 		}
 
 		void TryResumeAgentAfterDeterministicContexts()
 		{
-			if (bAgentWaitingForDeterministicContexts && PendingEventContextIds.IsEmpty() && PendingShaderDebugByRequest.IsEmpty())
+			if (bAgentWaitingForDeterministicContexts && !HasPendingCriticalDeterministicQueries())
 			{
 				bAgentWaitingForDeterministicContexts = false;
 				StartAgentAnalysis();
 			}
+			ReleaseBackgroundDeterministicQueries();
 		}
 
 		void StorePixelHistory(const TSharedRef<FJsonObject>& Message)
@@ -2642,6 +3827,7 @@ namespace UE::RenderTrail::Private
 				return;
 			}
 			FPixelSample* Sample = FindSample(*SampleId);
+			CompleteWorkerRequest(RequestId, TEXT("target_pixel_history"));
 			PendingSampleByRequest.Remove(RequestId);
 			if (!Sample)
 			{
@@ -2743,6 +3929,14 @@ namespace UE::RenderTrail::Private
 				}
 				Sample->Modifications.Add(MoveTemp(Evidence));
 			}
+			for (const FEventSummaryEvidence& Event : Sample->EventSummaries)
+			{
+				if (Event.EventId != 0 && Event.ActionKind != TEXT("present")
+					&& (Event.PassedFragments > 0 || Event.bChangedTextureValue))
+				{
+					EventTracePixels.FindOrAdd(Event.EventId, Sample->Pixel);
+				}
+			}
 
 			UpdateSelectionText();
 			RenderCausalReport();
@@ -2813,7 +4007,10 @@ namespace UE::RenderTrail::Private
 				return;
 			}
 
-			FString Report = TEXT("BOUNDED SINGLE-PIXEL CAUSAL REPORT\n\nPixel\n");
+			FString Report = FString::Printf(
+				TEXT("BOUNDED SINGLE-PIXEL CAUSAL REPORT\n\nReplay target: resource=%d format=%s extent=%dx%d samples=%d\n\nPixel\n"),
+				ReplayTargetResourceIndex, ReplayTargetFormat.IsEmpty() ? TEXT("unknown") : *ReplayTargetFormat,
+				CurrentPreviewSize.X, CurrentPreviewSize.Y, ReplayTargetSamples);
 			bool bAnyPending = false;
 			bool bAnyIncompleteEventSummary = false;
 			TArray<const FPixelSample*> ReadySamples;
@@ -3067,8 +4264,9 @@ namespace UE::RenderTrail::Private
 							break;
 						}
 						Report += Input.bTexture
-							? FString::Printf(TEXT("- Bound input candidate: %s [%s, %s] %s %dx%d；像素贡献尚未由绑定本身证明\n"),
-								*Input.Name, *Input.Stage, *Input.Access, *Input.Format, Input.Width, Input.Height)
+							? FString::Printf(TEXT("- Bound input candidate: %s binding=%s [%s, %s] %s %dx%d samples=%d；像素贡献尚未由绑定本身证明\n"),
+								*Input.Name, Input.ShaderBinding.IsEmpty() ? TEXT("unknown") : *Input.ShaderBinding,
+								*Input.Stage, *Input.Access, *Input.Format, Input.Width, Input.Height, Input.Samples)
 							: FString::Printf(TEXT("- Bound input candidate: %s [%s, %s] buffer/resource；像素贡献尚未证明\n"),
 								*Input.Name, *Input.Stage, *Input.Access);
 					}
@@ -3129,6 +4327,40 @@ namespace UE::RenderTrail::Private
 						{
 							Report += FString::Printf(TEXT("- Resource chain break: %s ← 未找到此前有效写入；%s；%s\n"),
 								*ResourceName, *CoordinateMapping, *ChainBreak);
+						}
+					}
+
+					if (!Context->ResourcePixelHistories.IsEmpty())
+					{
+						Report += TEXT("\nResource/sample Pixel History branches\n");
+						for (const TSharedPtr<FJsonValue>& HistoryValue : Context->ResourcePixelHistories)
+						{
+							const TSharedPtr<FJsonObject> History = HistoryValue.IsValid() ? HistoryValue->AsObject() : nullptr;
+							if (!History.IsValid())
+							{
+								continue;
+							}
+							FString ResourceName;
+							FString ShaderBinding;
+							FString BranchStatus;
+							FString Mapping;
+							double X = 0.0;
+							double Y = 0.0;
+							double SampleIndex = 0.0;
+							double TotalEvents = 0.0;
+							History->TryGetStringField(TEXT("resourceName"), ResourceName);
+							History->TryGetStringField(TEXT("shaderBinding"), ShaderBinding);
+							History->TryGetStringField(TEXT("branchStatus"), BranchStatus);
+							History->TryGetStringField(TEXT("coordinateMapping"), Mapping);
+							History->TryGetNumberField(TEXT("x"), X);
+							History->TryGetNumberField(TEXT("y"), Y);
+							History->TryGetNumberField(TEXT("sample"), SampleIndex);
+							History->TryGetNumberField(TEXT("totalEvents"), TotalEvents);
+							Report += FString::Printf(TEXT("- %s/%s pixel=(%d,%d) sample=%d mapping=%s events=%d status=%s\n"),
+								*ResourceName, ShaderBinding.IsEmpty() ? TEXT("unknown-binding") : *ShaderBinding,
+								static_cast<int32>(X), static_cast<int32>(Y), static_cast<int32>(SampleIndex),
+								Mapping.IsEmpty() ? TEXT("unknown") : *Mapping, static_cast<int32>(TotalEvents),
+								BranchStatus.IsEmpty() ? TEXT("unknown") : *BranchStatus);
 						}
 					}
 
@@ -3238,11 +4470,12 @@ namespace UE::RenderTrail::Private
 				{
 					const uint32 EventId = RecursiveContextIds[Index];
 					const FEventContextEvidence& Context = EventContexts.FindChecked(EventId);
-					Report += FString::Printf(TEXT("- depth=%d EID %u [%s] %s\n  marker/pass: %s\n  shader: %s%s；inputs=%d；outputs=%d；pipeline=%s\n"),
+					Report += FString::Printf(TEXT("- depth=%d EID %u [%s] %s\n  marker/pass: %s\n  shader: %s%s；inputs=%d；outputs=%d；resource/sample branches=%d；pipeline=%s\n"),
 						EventContextDepths.FindRef(EventId), EventId, *Context.ActionKind, *Context.Action,
 						*CompactMarkerPath(Context.MarkerPath), *Context.ShaderStage,
 						Context.ShaderEntry.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("/%s"), *Context.ShaderEntry),
-						Context.Inputs.Num(), Context.Outputs.Num(), Context.PipelineState.IsValid() ? TEXT("available") : TEXT("unavailable"));
+						Context.Inputs.Num(), Context.Outputs.Num(), Context.ResourcePixelHistories.Num(),
+						Context.PipelineState.IsValid() ? TEXT("available") : TEXT("unavailable"));
 				}
 			}
 
@@ -3270,6 +4503,16 @@ namespace UE::RenderTrail::Private
 		TMap<uint32, int32> EventContextDepths;
 		TMap<FString, uint32> PendingEventContextByRequest;
 		TMap<FString, uint32> PendingShaderDebugByRequest;
+		TMap<FString, FResourcePixelHistoryRequest> PendingResourcePixelHistoryByRequest;
+		TMap<FString, TArray<FString>> ResourcePixelHistoryBindingAliases;
+		TSet<uint32> DeferredResourceHistoryContextIds;
+		TMap<uint32, int32> DeferredResourceHistoryBranchCounts;
+		TSet<uint32> DeferredEventContextIds;
+		TMap<FString, double> WorkerRequestQueuedSeconds;
+		TMap<FString, FString> WorkerRequestCommands;
+		TMap<uint32, FIntPoint> EventTracePixels;
+		TSet<FString> ScheduledResourcePixelHistoryKeys;
+		TSet<FString> FailedResourcePixelHistoryKeys;
 		TSet<uint32> PendingEventContextIds;
 		TSet<uint32> FailedEventContextIds;
 		TSet<uint32> FailedShaderDebugIds;
@@ -3286,7 +4529,13 @@ namespace UE::RenderTrail::Private
 		FRenderTrailAnalyzerDiagnostics Diagnostics;
 		FRenderTrailReplayWorkerClient ReplayWorker;
 		FString PreviewPath;
+		FString ReplayTargetFormat;
+		FString ActiveWorkerRequestId;
+		FString ActiveWorkerStage;
 		FIntPoint CurrentPreviewSize = FIntPoint::ZeroValue;
+		int32 ReplayTargetResourceIndex = INDEX_NONE;
+		int32 ReplayTargetSamples = 1;
+		int32 ResourcePixelHistoryQueriesSubmitted = 0;
 		uint64 PreviewSerial = 0;
 		uint64 RequestSerial = 0;
 		uint64 SampleSerial = 0;
@@ -3302,15 +4551,29 @@ namespace UE::RenderTrail::Private
 		bool bReplaySynchronizationPending = false;
 		bool bReplayStartDeferred = false;
 		bool bQueuePixelHistoryAfterWorkerReady = false;
+		bool bBackgroundDeterministicQueriesReleased = false;
 		double CaptureLoadStartSeconds = 0.0;
 		double LastCaptureLoadStatusSeconds = 0.0;
+		double LastWorkerHeartbeatSeconds = 0.0;
+		double LastReplayQueryStatusSeconds = 0.0;
+		double ActiveWorkerRequestStartSeconds = 0.0;
+		uint64 WorkerQueueOrdinal = 0;
 		FString CaptureLoadPhase;
+		FString LastWorkerDiagnosticPhase;
 		static constexpr int32 MaxPixelSamples = 1;
 		static constexpr int32 MaxDisplayedTraceHops = 24;
 		static constexpr int32 MaxDisplayedFrontierResources = 6;
 		static constexpr int32 MaxAgentPrefilterEventsPerSample = 6;
 		static constexpr int32 MaxAgentEventChainPerSample = 48;
+		static constexpr int32 MaxAgentEventsPerResourceHistory = 4;
+		static constexpr int32 MaxAgentTextureAccesses = 24;
+		static constexpr int32 MaxAgentDeterministicContexts = 12;
+		static constexpr int32 MaxAgentBoundResourcesPerContext = 8;
+		static constexpr int32 MaxAgentResourceHistoriesPerContext = 8;
 		static constexpr int32 MaxDeterministicContextEvents = 24;
+		static constexpr int32 MaxResourcePixelHistoryQueries = 48;
+		static constexpr int32 MaxSamplesPerResourceTrace = 8;
+		static constexpr int32 MaxWriterContextsPerResourceTrace = 3;
 		static constexpr int32 MaxAgentSteps = 1;
 	};
 }

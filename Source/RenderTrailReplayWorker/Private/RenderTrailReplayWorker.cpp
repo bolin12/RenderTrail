@@ -8,6 +8,8 @@
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeLock.h"
+#include "Internationalization/Regex.h"
 #include "Policies/CondensedJsonPrintPolicy.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -70,6 +72,25 @@ namespace UE::RenderTrail::Private
 	static FString FromRdcString(const rdcstr& Value)
 	{
 		return FString(UTF8_TO_TCHAR(Value.c_str()));
+	}
+
+	static FString DescribeRenderDocLoadProgress(float OverallProgress)
+	{
+		// RenderDoc v1.45 weights LoadProgress as 10% debug resources,
+		// 75% initial resource/chunk loading, and 15% frame event replay.
+		const float Clamped = FMath::Clamp(OverallProgress, 0.0f, 1.0f);
+		if (Clamped < 0.10f)
+		{
+			return FString::Printf(TEXT("debug resource initialisation %.1f%% (overall %.1f%%)"),
+				Clamped * 1000.0f, Clamped * 100.0f);
+		}
+		if (Clamped < 0.85f)
+		{
+			return FString::Printf(TEXT("resource/chunk initialisation %.1f%% (overall %.1f%%)"),
+				((Clamped - 0.10f) / 0.75f) * 100.0f, Clamped * 100.0f);
+		}
+		return FString::Printf(TEXT("frame event replay %.1f%% (overall %.1f%%)"),
+			((Clamped - 0.85f) / 0.15f) * 100.0f, Clamped * 100.0f);
 	}
 
 	template <typename T>
@@ -405,12 +426,14 @@ namespace UE::RenderTrail::Private
 			}
 			#endif
 			const double LoadStartSeconds = FPlatformTime::Seconds();
+			SessionStartSeconds = LoadStartSeconds;
 			auto Report = [&Progress, LoadStartSeconds](const FString& Phase)
 			{
 				Progress(Phase, FPlatformTime::Seconds() - LoadStartSeconds);
 			};
 			CapturePath = FPaths::ConvertRelativePathToFull(InCapturePath);
 			PreviewPath = FPaths::ConvertRelativePathToFull(InPreviewPath);
+			Report(TEXT("Validating replay inputs"));
 			if (!FPaths::FileExists(CapturePath))
 			{
 				OutError = FString::Printf(TEXT("Capture does not exist: %s"), *CapturePath);
@@ -423,6 +446,8 @@ namespace UE::RenderTrail::Private
 				OutError = FString::Printf(TEXT("RenderDoc replay DLL was not found: %s"), *RenderDocDll);
 				return false;
 			}
+			Report(TEXT("Loading RenderDoc replay DLL"));
+			const double DllLoadStartSeconds = FPlatformTime::Seconds();
 			DllHandle = FPlatformProcess::GetDllHandle(*RenderDocDll);
 			if (!DllHandle)
 			{
@@ -446,6 +471,10 @@ namespace UE::RenderTrail::Private
 
 			RenderDocVersion = UTF8_TO_TCHAR(RENDERDOC_GetVersionString());
 			RenderDocCommit = UTF8_TO_TCHAR(RENDERDOC_GetCommitHash());
+			Report(FString::Printf(TEXT("RenderDoc replay DLL loaded: version=%s commit=%s duration=%.3fs"),
+				*RenderDocVersion, *RenderDocCommit, FPlatformTime::Seconds() - DllLoadStartSeconds));
+			Report(TEXT("Initialising RenderDoc replay runtime and enumerating GPUs"));
+			const double ReplayInitStartSeconds = FPlatformTime::Seconds();
 			GlobalEnvironment Environment;
 			Environment.enumerateGPUs = true;
 			rdcarray<rdcstr> ReplayArguments;
@@ -454,7 +483,10 @@ namespace UE::RenderTrail::Private
 			#if RENDERTRAIL_REPLAY_WORKER_PROGRAM
 			GReplayInitialized = true;
 			#endif
+			Report(FString::Printf(TEXT("RenderDoc replay runtime initialised: duration=%.3fs"),
+				FPlatformTime::Seconds() - ReplayInitStartSeconds));
 
+			Report(TEXT("Creating capture file handle"));
 			ICaptureFile* File = RENDERDOC_OpenCaptureFile();
 			if (!File)
 			{
@@ -462,6 +494,9 @@ namespace UE::RenderTrail::Private
 				return false;
 			}
 
+			const int64 CaptureBytes = IFileManager::Get().FileSize(*CapturePath);
+			Report(FString::Printf(TEXT("Opening RDC container: bytes=%lld"), CaptureBytes));
+			const double OpenFileStartSeconds = FPlatformTime::Seconds();
 			const FTCHARToUTF8 CaptureUtf8(*CapturePath);
 			const ResultDetails OpenFileResult = File->OpenFile(rdcstr(CaptureUtf8.Get()), "rdc", nullptr);
 			if (!OpenFileResult.OK())
@@ -470,7 +505,8 @@ namespace UE::RenderTrail::Private
 				File->Shutdown();
 				return false;
 			}
-			Report(TEXT("RDC container opened"));
+			Report(FString::Printf(TEXT("RDC container opened: duration=%.3fs"),
+				FPlatformTime::Seconds() - OpenFileStartSeconds));
 
 			// A native-size preview captured by the editor is pixel-addressable and must
 			// not be overwritten by RenderDoc's window thumbnail while Replay is opening.
@@ -507,7 +543,36 @@ namespace UE::RenderTrail::Private
 				}
 			}
 
-			const rdcpair<ResultDetails, IReplayController*> OpenCaptureResult = File->OpenCapture(ReplayOptions(), nullptr);
+			Report(TEXT("RenderDoc OpenCapture begin: creating device, restoring resources, and replaying initial events"));
+			const double OpenCaptureStartSeconds = FPlatformTime::Seconds();
+			FCriticalSection ReplayProgressLock;
+			int32 LastProgressBucket = INDEX_NONE;
+			double LastProgressReportSeconds = OpenCaptureStartSeconds;
+			float LastOverallProgress = 0.0f;
+			const RENDERDOC_ProgressCallback ReplayProgress =
+				[&Report, &ReplayProgressLock, &LastProgressBucket, &LastProgressReportSeconds, &LastOverallProgress](float Value)
+			{
+				FScopeLock Lock(&ReplayProgressLock);
+				const float Clamped = FMath::Clamp(Value, 0.0f, 1.0f);
+				LastOverallProgress = Clamped;
+				const int32 Bucket = FMath::FloorToInt(Clamped * 20.0f);
+				const double Now = FPlatformTime::Seconds();
+				if (LastProgressBucket == INDEX_NONE || Bucket > LastProgressBucket
+					|| Bucket < LastProgressBucket || Now - LastProgressReportSeconds >= 10.0)
+				{
+					Report(FString::Printf(TEXT("RenderDoc OpenCapture progress: %s"),
+						*DescribeRenderDocLoadProgress(Clamped)));
+					LastProgressBucket = Bucket;
+					LastProgressReportSeconds = Now;
+				}
+			};
+			const rdcpair<ResultDetails, IReplayController*> OpenCaptureResult =
+				File->OpenCapture(ReplayOptions(), ReplayProgress);
+			const double OpenCaptureDuration = FPlatformTime::Seconds() - OpenCaptureStartSeconds;
+			Report(FString::Printf(TEXT("RenderDoc OpenCapture returned: success=%s duration=%.3fs lastProgress=%s result=%s"),
+				OpenCaptureResult.first.OK() && OpenCaptureResult.second ? TEXT("true") : TEXT("false"),
+				OpenCaptureDuration, *DescribeRenderDocLoadProgress(LastOverallProgress),
+				*ResultMessage(OpenCaptureResult.first)));
 			if (!OpenCaptureResult.first.OK() || !OpenCaptureResult.second)
 			{
 				OutError = FString::Printf(TEXT("Could not create replay: %s"), *ResultMessage(OpenCaptureResult.first));
@@ -516,7 +581,8 @@ namespace UE::RenderTrail::Private
 			}
 			Controller = OpenCaptureResult.second;
 			File->Shutdown();
-			Report(TEXT("Replay controller created"));
+			Report(TEXT("Replay controller created; reading API properties, actions, textures, and resources"));
+			const double MetadataStartSeconds = FPlatformTime::Seconds();
 
 			const APIProperties Properties = Controller->GetAPIProperties();
 			bPixelHistorySupported = Properties.pixelHistory;
@@ -530,6 +596,10 @@ namespace UE::RenderTrail::Private
 
 			const rdcarray<TextureDescription>& Textures = Controller->GetTextures();
 			const rdcarray<ResourceDescription>& Resources = Controller->GetResources();
+			Report(FString::Printf(TEXT("Replay metadata read: rootActions=%llu flatActions=%d textures=%llu resources=%llu duration=%.3fs"),
+				static_cast<unsigned long long>(Actions.size()), FlatActions.Num(),
+				static_cast<unsigned long long>(Textures.size()), static_cast<unsigned long long>(Resources.size()),
+				FPlatformTime::Seconds() - MetadataStartSeconds));
 			auto IsTexture = [&Textures](ResourceId Candidate)
 			{
 				for (const TextureDescription& Texture : Textures)
@@ -688,6 +758,13 @@ namespace UE::RenderTrail::Private
 					Width = Texture.width;
 					Height = Texture.height;
 					TargetCompType = Texture.format.compType;
+					TargetSamples = FMath::Max(1U, Texture.msSamp);
+					rdcstr FormatName;
+					if (ResourceFormatName)
+					{
+						ResourceFormatName(Texture.format, FormatName);
+					}
+					TargetFormat = FormatName.empty() ? TEXT("unknown") : FromRdcString(FormatName);
 					break;
 				}
 			}
@@ -696,6 +773,7 @@ namespace UE::RenderTrail::Private
 				if (Resource.resourceId == TargetTexture)
 				{
 					TargetName = FromRdcString(Resource.name);
+					TargetResourceIndex = static_cast<int32>(&Resource - Resources.data());
 					break;
 				}
 			}
@@ -715,7 +793,11 @@ namespace UE::RenderTrail::Private
 
 			if (FinalEventId > 0)
 			{
+				const double SetEventStartSeconds = FPlatformTime::Seconds();
+				Report(FString::Printf(TEXT("SetFrameEvent begin: eventId=%u force=true"), FinalEventId));
 				Controller->SetFrameEvent(FinalEventId, true);
+				Report(FString::Printf(TEXT("SetFrameEvent complete: eventId=%u duration=%.3fs"),
+					FinalEventId, FPlatformTime::Seconds() - SetEventStartSeconds));
 			}
 			IFileManager::Get().MakeDirectory(*FPaths::GetPath(PreviewPath), true);
 			TextureSave Save;
@@ -724,7 +806,13 @@ namespace UE::RenderTrail::Private
 			Save.mip = 0;
 			Save.alpha = AlphaMapping::Discard;
 			const FTCHARToUTF8 PreviewUtf8(*PreviewPath);
+			const double SaveTextureStartSeconds = FPlatformTime::Seconds();
+			Report(FString::Printf(TEXT("SaveTexture begin: target=%s %ux%u eventId=%u"),
+				TargetName.IsEmpty() ? TEXT("<unnamed>") : *TargetName, Width, Height, FinalEventId));
 			const ResultDetails SaveResult = Controller->SaveTexture(Save, rdcstr(PreviewUtf8.Get()));
+			Report(FString::Printf(TEXT("SaveTexture returned: success=%s duration=%.3fs result=%s"),
+				SaveResult.OK() ? TEXT("true") : TEXT("false"),
+				FPlatformTime::Seconds() - SaveTextureStartSeconds, *ResultMessage(SaveResult)));
 			if (!SaveResult.OK())
 			{
 				OutError = FString::Printf(TEXT("Could not export preview: %s"), *ResultMessage(SaveResult));
@@ -744,7 +832,10 @@ namespace UE::RenderTrail::Private
 			Object->SetNumberField(TEXT("width"), Width);
 			Object->SetNumberField(TEXT("height"), Height);
 			Object->SetNumberField(TEXT("finalEventId"), FinalEventId);
+			Object->SetNumberField(TEXT("targetResourceIndex"), TargetResourceIndex);
+			Object->SetNumberField(TEXT("targetSamples"), TargetSamples);
 			Object->SetStringField(TEXT("targetName"), TargetName);
+			Object->SetStringField(TEXT("targetFormat"), TargetFormat);
 			Object->SetStringField(TEXT("renderDocVersion"), RenderDocVersion);
 			Object->SetStringField(TEXT("renderDocCommit"), RenderDocCommit);
 			Object->SetBoolField(TEXT("pixelHistorySupported"), bPixelHistorySupported);
@@ -755,7 +846,8 @@ namespace UE::RenderTrail::Private
 			Emit(Object);
 		}
 
-		void QueryPixelHistory(uint32 X, uint32 Y, const FString& RequestId)
+		void QueryPixelHistory(uint32 X, uint32 Y, int32 ResourceIndex, uint32 Mip, uint32 Slice,
+			uint32 SampleIndex, uint32 BeforeEventId, int32 TypeCastOverride, const FString& RequestId)
 		{
 			if (!Controller)
 			{
@@ -767,9 +859,59 @@ namespace UE::RenderTrail::Private
 				EmitError(TEXT("pixel_history"), TEXT("This replay API/driver does not support Pixel History."), RequestId);
 				return;
 			}
-			if (X >= Width || Y >= Height)
+			ResourceId TextureId = TargetTexture;
+			FString TextureName = TargetName;
+			const TextureDescription* TextureDescriptionValue = nullptr;
+			CompType TypeCast = TypeCastOverride >= 0
+				? static_cast<CompType>(TypeCastOverride) : TargetCompType;
+			const rdcarray<ResourceDescription>& Resources = Controller->GetResources();
+			const rdcarray<TextureDescription>& Textures = Controller->GetTextures();
+			if (ResourceIndex >= 0)
 			{
-				EmitError(TEXT("pixel_history"), FString::Printf(TEXT("Pixel (%u, %u) is outside %ux%u."), X, Y, Width, Height), RequestId);
+				if (ResourceIndex >= static_cast<int32>(Resources.size()))
+				{
+					EmitError(TEXT("pixel_history"), FString::Printf(TEXT("Resource index %d is invalid."), ResourceIndex), RequestId);
+					return;
+				}
+				TextureId = Resources[ResourceIndex].resourceId;
+				TextureName = FromRdcString(Resources[ResourceIndex].name);
+			}
+			else
+			{
+				ResourceIndex = TargetResourceIndex;
+			}
+			for (const TextureDescription& Texture : Textures)
+			{
+				if (Texture.resourceId == TextureId)
+				{
+					TextureDescriptionValue = &Texture;
+					if (TypeCastOverride < 0)
+					{
+						TypeCast = Texture.format.compType;
+					}
+					break;
+				}
+			}
+			if (!TextureDescriptionValue)
+			{
+				EmitError(TEXT("pixel_history"), FString::Printf(TEXT("Resource %d is not a texture."), ResourceIndex), RequestId);
+				return;
+			}
+			if (Mip >= TextureDescriptionValue->mips || Slice >= TextureDescriptionValue->arraysize
+				|| SampleIndex >= FMath::Max(1U, TextureDescriptionValue->msSamp))
+			{
+				EmitError(TEXT("pixel_history"), FString::Printf(
+					TEXT("Subresource mip=%u slice=%u sample=%u is invalid for resource %d (mips=%u slices=%u samples=%u)."),
+					Mip, Slice, SampleIndex, ResourceIndex, TextureDescriptionValue->mips,
+					TextureDescriptionValue->arraysize, FMath::Max(1U, TextureDescriptionValue->msSamp)), RequestId);
+				return;
+			}
+			const uint32 QueryWidth = FMath::Max(1U, TextureDescriptionValue->width >> Mip);
+			const uint32 QueryHeight = FMath::Max(1U, TextureDescriptionValue->height >> Mip);
+			if (X >= QueryWidth || Y >= QueryHeight)
+			{
+				EmitError(TEXT("pixel_history"), FString::Printf(TEXT("Pixel (%u, %u) is outside resource %d size %ux%u."),
+					X, Y, ResourceIndex, QueryWidth, QueryHeight), RequestId);
 				return;
 			}
 			FString ActionIndexError;
@@ -779,8 +921,29 @@ namespace UE::RenderTrail::Private
 				return;
 			}
 
-			const rdcarray<PixelModification> Modifications = Controller->PixelHistory(TargetTexture, X, Y, Subresource(0, 0, 0), TargetCompType);
-			const int32 Total = static_cast<int32>(Modifications.size());
+			const double QueryStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("pixel_history"), TEXT("begin"), QueryStartSeconds,
+				FString::Printf(TEXT("requestId=%s resource=%d name=%s pixel=(%u,%u) sub=(%u,%u,%u) beforeEvent=%u"),
+					*RequestId, ResourceIndex, TextureName.IsEmpty() ? TEXT("<unnamed>") : *TextureName,
+					X, Y, Mip, Slice, SampleIndex, BeforeEventId), RequestId);
+			const double ReplayCallStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("pixel_history.replay"), TEXT("begin"), ReplayCallStartSeconds,
+				TEXT("Calling IReplayController::PixelHistory"), RequestId);
+			const rdcarray<PixelModification> Modifications = Controller->PixelHistory(
+				TextureId, X, Y, Subresource(Mip, Slice, SampleIndex), TypeCast);
+			TArray<const PixelModification*> RelevantModifications;
+			RelevantModifications.Reserve(static_cast<int32>(Modifications.size()));
+			for (const PixelModification& Modification : Modifications)
+			{
+				if (BeforeEventId == 0 || Modification.eventId < BeforeEventId)
+				{
+					RelevantModifications.Add(&Modification);
+				}
+			}
+			const int32 RawTotal = static_cast<int32>(Modifications.size());
+			const int32 Total = RelevantModifications.Num();
+			EmitDiagnostic(TEXT("pixel_history.replay"), TEXT("end"), ReplayCallStartSeconds,
+				FString::Printf(TEXT("rawModifications=%d relevantModifications=%d"), RawTotal, Total), RequestId);
 			const int32 First = bFullDiagnostics ? 0 : FMath::Max(0, Total - MaxSerializedPixelModifications);
 			TArray<TSharedPtr<FJsonValue>> JsonModifications;
 			JsonModifications.Reserve(Total - First);
@@ -788,7 +951,7 @@ namespace UE::RenderTrail::Private
 			TArray<uint32> EventSummaryOrder;
 			for (int32 Index = 0; Index < Total; ++Index)
 			{
-				const PixelModification& Modification = Modifications[Index];
+				const PixelModification& Modification = *RelevantModifications[Index];
 				TSharedPtr<FJsonObject>* ExistingSummary = EventSummaryById.Find(Modification.eventId);
 				if (!ExistingSummary)
 				{
@@ -859,7 +1022,7 @@ namespace UE::RenderTrail::Private
 			}
 			for (int32 Index = First; Index < Total; ++Index)
 			{
-				const PixelModification& Modification = Modifications[Index];
+				const PixelModification& Modification = *RelevantModifications[Index];
 				const TSharedRef<FJsonObject> Item = MakeShared<FJsonObject>();
 				Item->SetNumberField(TEXT("eventId"), Modification.eventId);
 				Item->SetStringField(TEXT("action"), ActionNames.FindRef(Modification.eventId));
@@ -885,6 +1048,13 @@ namespace UE::RenderTrail::Private
 			Object->SetStringField(TEXT("requestId"), RequestId);
 			Object->SetNumberField(TEXT("x"), X);
 			Object->SetNumberField(TEXT("y"), Y);
+			Object->SetNumberField(TEXT("resourceIndex"), ResourceIndex);
+			Object->SetStringField(TEXT("resourceName"), TextureName);
+			Object->SetNumberField(TEXT("mip"), Mip);
+			Object->SetNumberField(TEXT("slice"), Slice);
+			Object->SetNumberField(TEXT("sample"), SampleIndex);
+			Object->SetNumberField(TEXT("beforeEventId"), BeforeEventId);
+			Object->SetNumberField(TEXT("rawModifications"), RawTotal);
 			Object->SetNumberField(TEXT("totalModifications"), Total);
 			Object->SetNumberField(TEXT("returnedModifications"), Total - First);
 			Object->SetBoolField(TEXT("truncated"), First > 0);
@@ -892,6 +1062,8 @@ namespace UE::RenderTrail::Private
 			Object->SetNumberField(TEXT("totalEvents"), EventSummaryOrder.Num());
 			Object->SetArrayField(TEXT("eventSummaries"), MoveTemp(JsonEventSummaries));
 			Object->SetArrayField(TEXT("modifications"), MoveTemp(JsonModifications));
+			EmitDiagnostic(TEXT("pixel_history"), TEXT("end"), QueryStartSeconds,
+				FString::Printf(TEXT("events=%d returnedModifications=%d"), EventSummaryOrder.Num(), Total - First), RequestId);
 			Emit(Object);
 		}
 
@@ -914,12 +1086,44 @@ namespace UE::RenderTrail::Private
 				return;
 			}
 
+			const double QueryStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("event_context"), TEXT("begin"), QueryStartSeconds,
+				FString::Printf(TEXT("requestId=%s eventId=%u"), *RequestId, EventId), RequestId);
+			const double SetEventStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("event_context.set_frame_event"), TEXT("begin"), SetEventStartSeconds,
+				FString::Printf(TEXT("eventId=%u force=true"), EventId), RequestId);
 			Controller->SetFrameEvent(EventId, true);
+			EmitDiagnostic(TEXT("event_context.set_frame_event"), TEXT("end"), SetEventStartSeconds,
+				FString::Printf(TEXT("eventId=%u"), EventId), RequestId);
+			const double CollectStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("event_context.collect"), TEXT("begin"), CollectStartSeconds,
+				TEXT("Collecting descriptors, resources, provenance, pipeline, and shader reflection"), RequestId);
 			const FString Kind = ActionKinds.FindRef(EventId);
 			const ShaderStage Stage = Kind == TEXT("dispatch") ? ShaderStage::Compute : ShaderStage::Pixel;
 			const TCHAR* StageName = Stage == ShaderStage::Compute ? TEXT("compute") : TEXT("pixel");
 			const rdcarray<ResourceDescription>& Resources = Controller->GetResources();
 			const rdcarray<TextureDescription>& Textures = Controller->GetTextures();
+			const ShaderReflection* BindingShader = nullptr;
+			if (const D3D12Pipe::State* D3D12State = Controller->GetD3D12PipelineState())
+			{
+				BindingShader = Stage == ShaderStage::Compute
+					? D3D12State->computeShader.reflection : D3D12State->pixelShader.reflection;
+			}
+			else if (const D3D11Pipe::State* D3D11State = Controller->GetD3D11PipelineState())
+			{
+				BindingShader = Stage == ShaderStage::Compute
+					? D3D11State->computeShader.reflection : D3D11State->pixelShader.reflection;
+			}
+			else if (const GLPipe::State* GLState = Controller->GetGLPipelineState())
+			{
+				BindingShader = Stage == ShaderStage::Compute
+					? GLState->computeShader.reflection : GLState->fragmentShader.reflection;
+			}
+			else if (const VKPipe::State* VulkanState = Controller->GetVulkanPipelineState())
+			{
+				BindingShader = Stage == ShaderStage::Compute
+					? VulkanState->computeShader.reflection : VulkanState->fragmentShader.reflection;
+			}
 
 			auto ResourceToJson = [this, &Resources, &Textures](ResourceId Id, const FString& StageText, const FString& Access)
 			{
@@ -966,7 +1170,8 @@ namespace UE::RenderTrail::Private
 			};
 
 			TArray<TSharedPtr<FJsonValue>> Inputs;
-			TArray<ResourceId> SeenInputs;
+			TArray<ResourceId> InputResources;
+			TArray<FString> InputShaderBindings;
 			for (const DescriptorAccess& Access : Controller->GetDescriptorAccess())
 			{
 				if (Access.stage != Stage || Access.staticallyUnused
@@ -981,15 +1186,46 @@ namespace UE::RenderTrail::Private
 				{
 					continue;
 				}
-				const ResourceId Resource = Descriptors[0].resource;
-				if (Resource == ResourceId() || SeenInputs.Contains(Resource)
+				const Descriptor& DescriptorValue = Descriptors[0];
+				const ResourceId Resource = DescriptorValue.resource;
+				if (Resource == ResourceId()
 					|| (!bFullDiagnostics && Inputs.Num() >= MaxSerializedEventResources))
 				{
 					continue;
 				}
-				SeenInputs.Add(Resource);
-				Inputs.Add(MakeShared<FJsonValueObject>(ResourceToJson(Resource, StageName,
-					IsReadWriteDescriptor(Access.type) ? TEXT("read-write") : TEXT("read"))));
+
+				FString ShaderBinding;
+				if (BindingShader && Access.index != DescriptorAccess::NoShaderBinding)
+				{
+					if (IsReadWriteDescriptor(Access.type)
+						&& Access.index < BindingShader->readWriteResources.size())
+					{
+						ShaderBinding = FromRdcString(BindingShader->readWriteResources[Access.index].name);
+					}
+					else if (Access.index < BindingShader->readOnlyResources.size())
+					{
+						ShaderBinding = FromRdcString(BindingShader->readOnlyResources[Access.index].name);
+					}
+				}
+
+				const TSharedRef<FJsonObject> Input = ResourceToJson(Resource, StageName,
+					IsReadWriteDescriptor(Access.type) ? TEXT("read-write") : TEXT("read"));
+				Input->SetStringField(TEXT("shaderBinding"), ShaderBinding);
+				Input->SetNumberField(TEXT("bindingIndex"), Access.index);
+				Input->SetNumberField(TEXT("arrayElement"), Access.arrayElement);
+				Input->SetNumberField(TEXT("firstMip"), DescriptorValue.firstMip);
+				Input->SetNumberField(TEXT("firstSlice"), DescriptorValue.firstSlice);
+				Input->SetNumberField(TEXT("typeCast"), static_cast<int32>(DescriptorValue.format.compType));
+				rdcstr DescriptorFormatName;
+				if (ResourceFormatName)
+				{
+					ResourceFormatName(DescriptorValue.format, DescriptorFormatName);
+				}
+				Input->SetStringField(TEXT("descriptorFormat"), DescriptorFormatName.empty()
+					? TEXT("unknown") : FromRdcString(DescriptorFormatName));
+				Inputs.Add(MakeShared<FJsonValueObject>(Input));
+				InputResources.Add(Resource);
+				InputShaderBindings.Add(ShaderBinding);
 			}
 
 			TArray<TSharedPtr<FJsonValue>> Outputs;
@@ -1025,8 +1261,10 @@ namespace UE::RenderTrail::Private
 			}
 
 			TArray<TSharedPtr<FJsonValue>> ResourceProvenance;
-			for (const ResourceId& InputResource : SeenInputs)
+			for (int32 InputIndex = 0; InputIndex < InputResources.Num(); ++InputIndex)
 			{
+				const ResourceId& InputResource = InputResources[InputIndex];
+				const FString& ShaderBinding = InputShaderBindings[InputIndex];
 				FString ResourceName;
 				int32 ResourceIndex = INDEX_NONE;
 				for (int32 Index = 0; Index < static_cast<int32>(Resources.size()); ++Index)
@@ -1062,7 +1300,7 @@ namespace UE::RenderTrail::Private
 				}
 
 				ResourceProvenance.Add(MakeShared<FJsonValueObject>(BuildResourceProvenance(
-					*Controller, InputResource, EventId, ResourceName, ResourceIndex, InputTexture, OutputTexture,
+					*Controller, InputResource, EventId, ResourceName, ShaderBinding, ResourceIndex, InputTexture, OutputTexture,
 					ActionNames, ActionKinds, ActionPaths)));
 			}
 
@@ -1143,15 +1381,25 @@ namespace UE::RenderTrail::Private
 			Object->SetArrayField(TEXT("outputs"), MoveTemp(Outputs));
 			Object->SetArrayField(TEXT("resourceProvenance"), MoveTemp(ResourceProvenance));
 			Object->SetObjectField(TEXT("pipelineState"), PipelineState);
+			EmitDiagnostic(TEXT("event_context.collect"), TEXT("end"), CollectStartSeconds,
+				FString::Printf(TEXT("inputs=%d outputs=%d provenance=%d"),
+					InputResources.Num(), SeenOutputs.Num(), Object->GetArrayField(TEXT("resourceProvenance")).Num()), RequestId);
 			Emit(Object);
 
 			if (FinalEventId > 0)
 			{
+				const double RestoreStartSeconds = FPlatformTime::Seconds();
+				EmitDiagnostic(TEXT("event_context.restore_frame_event"), TEXT("begin"), RestoreStartSeconds,
+					FString::Printf(TEXT("eventId=%u force=true"), FinalEventId), RequestId);
 				Controller->SetFrameEvent(FinalEventId, true);
+				EmitDiagnostic(TEXT("event_context.restore_frame_event"), TEXT("end"), RestoreStartSeconds,
+					FString::Printf(TEXT("eventId=%u"), FinalEventId), RequestId);
 			}
+			EmitDiagnostic(TEXT("event_context"), TEXT("end"), QueryStartSeconds,
+				FString::Printf(TEXT("eventId=%u"), EventId), RequestId);
 		}
 
-		void QueryShaderDebug(uint32 EventId, uint32 X, uint32 Y, uint32 PrimitiveId, bool bHasPrimitive,
+		void QueryShaderDebug(uint32 EventId, uint32 X, uint32 Y, int32 SampleIndex, uint32 PrimitiveId, bool bHasPrimitive,
 			const FString& RequestId)
 		{
 			if (!Controller)
@@ -1181,7 +1429,17 @@ namespace UE::RenderTrail::Private
 				return;
 			}
 
+			const double QueryStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("shader_debug"), TEXT("begin"), QueryStartSeconds,
+				FString::Printf(TEXT("requestId=%s eventId=%u pixel=(%u,%u) sample=%d primitive=%s%u"),
+					*RequestId, EventId, X, Y, SampleIndex,
+					bHasPrimitive ? TEXT("") : TEXT("unselected:"), PrimitiveId), RequestId);
+			const double SetEventStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("shader_debug.set_frame_event"), TEXT("begin"), SetEventStartSeconds,
+				FString::Printf(TEXT("eventId=%u force=true"), EventId), RequestId);
 			Controller->SetFrameEvent(EventId, true);
+			EmitDiagnostic(TEXT("shader_debug.set_frame_event"), TEXT("end"), SetEventStartSeconds,
+				FString::Printf(TEXT("eventId=%u"), EventId), RequestId);
 			const ShaderReflection* DebugShader = nullptr;
 			ResourceId DebugPipeline;
 			if (const D3D12Pipe::State* D3D12State = Controller->GetD3D12PipelineState())
@@ -1193,15 +1451,29 @@ namespace UE::RenderTrail::Private
 			{
 				DebugShader = D3D11State->pixelShader.reflection;
 			}
+			const double DisassembleStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("shader_debug.disassemble"), TEXT("begin"), DisassembleStartSeconds,
+				TEXT("Calling IReplayController::DisassembleShader"), RequestId);
 			const FString ShaderDisassembly = DebugShader
 				? FromRdcString(Controller->DisassembleShader(DebugPipeline, DebugShader, rdcstr()))
 				: FString();
+			EmitDiagnostic(TEXT("shader_debug.disassemble"), TEXT("end"), DisassembleStartSeconds,
+				FString::Printf(TEXT("characters=%d shaderAvailable=%s"), ShaderDisassembly.Len(), DebugShader ? TEXT("true") : TEXT("false")), RequestId);
 			DebugPixelInputs Inputs;
+			if (SampleIndex >= 0)
+			{
+				Inputs.sample = static_cast<uint32>(SampleIndex);
+			}
 			if (bHasPrimitive)
 			{
 				Inputs.primitive = PrimitiveId;
 			}
+			const double DebugPixelStartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("shader_debug.debug_pixel"), TEXT("begin"), DebugPixelStartSeconds,
+				TEXT("Calling IReplayController::DebugPixel"), RequestId);
 			ShaderDebugTrace* Trace = Controller->DebugPixel(X, Y, Inputs);
+			EmitDiagnostic(TEXT("shader_debug.debug_pixel"), Trace ? TEXT("end") : TEXT("error"), DebugPixelStartSeconds,
+				Trace ? TEXT("traceCreated=true") : TEXT("traceCreated=false"), RequestId);
 			if (!Trace)
 			{
 				EmitError(TEXT("shader_debug"), TEXT("RenderDoc could not create a pixel shader debug trace for this event/pixel."), RequestId);
@@ -1218,6 +1490,7 @@ namespace UE::RenderTrail::Private
 			Object->SetNumberField(TEXT("eventId"), EventId);
 			Object->SetNumberField(TEXT("x"), X);
 			Object->SetNumberField(TEXT("y"), Y);
+			Object->SetNumberField(TEXT("sample"), SampleIndex);
 			Object->SetNumberField(TEXT("primitiveId"), PrimitiveId);
 			Object->SetBoolField(TEXT("primitiveSelected"), bHasPrimitive);
 			Object->SetStringField(TEXT("stage"), RenderDocEnumToString(Trace->stage));
@@ -1229,7 +1502,8 @@ namespace UE::RenderTrail::Private
 			Object->SetNumberField(TEXT("readWriteResourceCount"), static_cast<double>(Trace->readWriteResources.size()));
 			Object->SetBoolField(TEXT("fullDiagnostics"), bFullDiagnostics);
 
-			auto SerializeShaderVariable = [](const ShaderVariable& Variable)
+			TFunction<TSharedRef<FJsonObject>(const ShaderVariable&, int32)> SerializeShaderVariable;
+			SerializeShaderVariable = [&SerializeShaderVariable](const ShaderVariable& Variable, int32 Depth)
 			{
 				const TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
 				Json->SetStringField(TEXT("name"), FromRdcString(Variable.name));
@@ -1295,6 +1569,16 @@ namespace UE::RenderTrail::Private
 					}
 				}
 				Json->SetArrayField(TEXT("values"), MoveTemp(Values));
+				TArray<TSharedPtr<FJsonValue>> Members;
+				if (Depth < 8)
+				{
+					Members.Reserve(static_cast<int32>(Variable.members.size()));
+					for (const ShaderVariable& Member : Variable.members)
+					{
+						Members.Add(MakeShared<FJsonValueObject>(SerializeShaderVariable(Member, Depth + 1)));
+					}
+				}
+				Json->SetArrayField(TEXT("members"), MoveTemp(Members));
 				return Json;
 			};
 
@@ -1319,7 +1603,7 @@ namespace UE::RenderTrail::Private
 				TArray<TSharedPtr<FJsonValue>> Values;
 				for (const ShaderVariable& Variable : Variables)
 				{
-					Values.Add(MakeShared<FJsonValueObject>(SerializeShaderVariable(Variable)));
+					Values.Add(MakeShared<FJsonValueObject>(SerializeShaderVariable(Variable, 0)));
 					if (!bFullDiagnostics && Values.Num() >= 32)
 					{
 						break;
@@ -1331,6 +1615,8 @@ namespace UE::RenderTrail::Private
 			Object->SetArrayField(TEXT("constantBlockVariables"), SerializeVariableNames(Trace->constantBlocks));
 			Object->SetArrayField(TEXT("inputVariableValues"), SerializeVariableValues(Trace->inputs));
 			Object->SetArrayField(TEXT("constantBlockVariableValues"), SerializeVariableValues(Trace->constantBlocks));
+			Object->SetArrayField(TEXT("readOnlyResourceVariables"), SerializeVariableValues(Trace->readOnlyResources));
+			Object->SetArrayField(TEXT("readWriteResourceVariables"), SerializeVariableValues(Trace->readWriteResources));
 			TArray<TSharedPtr<FJsonValue>> SourceVariableNames;
 			for (const SourceVariableMapping& Mapping : Trace->sourceVars)
 			{
@@ -1378,8 +1664,8 @@ namespace UE::RenderTrail::Private
 					{
 						const TSharedRef<FJsonObject> Changed = MakeShared<FJsonObject>();
 						Changed->SetStringField(TEXT("name"), FromRdcString(Name));
-						Changed->SetObjectField(TEXT("before"), SerializeShaderVariable(Change.before));
-						Changed->SetObjectField(TEXT("after"), SerializeShaderVariable(Change.after));
+						Changed->SetObjectField(TEXT("before"), SerializeShaderVariable(Change.before, 0));
+						Changed->SetObjectField(TEXT("after"), SerializeShaderVariable(Change.after, 0));
 						ChangedVariables.Add(MakeShared<FJsonValueObject>(Changed));
 					}
 					if (!bFullDiagnostics && ChangedVariables.Num() >= 32)
@@ -1403,12 +1689,41 @@ namespace UE::RenderTrail::Private
 
 			TArray<TSharedPtr<FJsonValue>> StepFlags;
 			TArray<TSharedPtr<FJsonValue>> TraceStateSamples;
+			TArray<TSharedPtr<FJsonValue>> TextureAccesses;
 			TArray<FIntPoint> ObservedInstructionLines;
 			TMap<uint32, int32> DisassemblyLineByInstruction;
+			TMap<uint32, FString> DisassemblyTextByInstruction;
+			TArray<FString> DisassemblyLines;
+			ShaderDisassembly.ParseIntoArrayLines(DisassemblyLines, false);
 			for (const InstructionSourceInfo& Info : Trace->instInfo)
 			{
-				DisassemblyLineByInstruction.Add(Info.instruction, static_cast<int32>(Info.lineInfo.disassemblyLine));
+				const int32 DisassemblyLine = static_cast<int32>(Info.lineInfo.disassemblyLine);
+				DisassemblyLineByInstruction.Add(Info.instruction, DisassemblyLine);
+				if (DisassemblyLines.IsValidIndex(DisassemblyLine))
+				{
+					DisassemblyTextByInstruction.Add(Info.instruction, DisassemblyLines[DisassemblyLine].TrimStartAndEnd());
+				}
 			}
+			TMap<FString, ShaderVariable> LiveVariables;
+			TSet<uint32> SerializedTextureInstructions;
+			auto ResolveTextureInstruction = [&DisassemblyTextByInstruction](uint32 EventInstruction)
+			{
+				for (uint32 Offset = 0; Offset <= 12 && Offset <= EventInstruction; ++Offset)
+				{
+					const uint32 CandidateInstruction = EventInstruction - Offset;
+					const FString CandidateText = DisassemblyTextByInstruction.FindRef(CandidateInstruction);
+					if (CandidateText.Contains(TEXT("textureLoad"), ESearchCase::IgnoreCase)
+						|| CandidateText.Contains(TEXT("textureSample"), ESearchCase::IgnoreCase)
+						|| CandidateText.Contains(TEXT("textureGather"), ESearchCase::IgnoreCase)
+						|| CandidateText.Contains(TEXT("sample"), ESearchCase::IgnoreCase)
+						|| CandidateText.Contains(TEXT("OpImage"), ESearchCase::IgnoreCase))
+					{
+						return CandidateInstruction;
+					}
+				}
+				return EventInstruction;
+			};
+			uint32 NextInstructionBeforeState = 0;
 			TSharedPtr<FJsonObject> FirstStateSnapshot;
 			TSharedPtr<FJsonObject> LastStateSnapshot;
 			int32 StepCount = 0;
@@ -1417,6 +1732,10 @@ namespace UE::RenderTrail::Private
 			bool bCompleted = Trace->debugger != nullptr;
 			if (Trace->debugger)
 			{
+				const double ContinueStartSeconds = FPlatformTime::Seconds();
+				EmitDiagnostic(TEXT("shader_debug.continue"), TEXT("begin"), ContinueStartSeconds,
+					FString::Printf(TEXT("stepLimit=%d"),
+						bFullDiagnostics ? FullDiagnosticsShaderDebugSteps : MaxShaderDebugSteps), RequestId);
 				while (StepCount < (bFullDiagnostics ? FullDiagnosticsShaderDebugSteps : MaxShaderDebugSteps))
 				{
 					const rdcarray<ShaderDebugState> States = Controller->ContinueDebug(Trace->debugger);
@@ -1426,6 +1745,8 @@ namespace UE::RenderTrail::Private
 					}
 					for (const ShaderDebugState& State : States)
 					{
+						const uint32 ExecutedInstruction = NextInstructionBeforeState;
+						NextInstructionBeforeState = State.nextInstruction;
 						++StepCount;
 						if (const int32* DisassemblyLine = DisassemblyLineByInstruction.Find(State.nextInstruction))
 						{
@@ -1433,6 +1754,54 @@ namespace UE::RenderTrail::Private
 								static_cast<int32>(State.nextInstruction), *DisassemblyLine));
 						}
 						TotalVariableChanges += static_cast<int32>(State.changes.size());
+						for (const ShaderVariableChange& Change : State.changes)
+						{
+							if (!Change.after.name.empty())
+							{
+								LiveVariables.Add(FromRdcString(Change.after.name), Change.after);
+							}
+							else if (!Change.before.name.empty())
+							{
+								LiveVariables.Remove(FromRdcString(Change.before.name));
+							}
+						}
+						if (static_cast<bool>(State.flags & ShaderEvents::SampleLoadGather)
+							&& TextureAccesses.Num() < MaxSerializedTextureAccesses)
+						{
+							const uint32 TextureInstruction = ResolveTextureInstruction(ExecutedInstruction);
+							if (!SerializedTextureInstructions.Contains(TextureInstruction))
+							{
+								SerializedTextureInstructions.Add(TextureInstruction);
+								const TSharedRef<FJsonObject> Access = MakeShared<FJsonObject>();
+								Access->SetNumberField(TEXT("stepIndex"), State.stepIndex);
+								Access->SetNumberField(TEXT("instruction"), TextureInstruction);
+								Access->SetNumberField(TEXT("eventInstruction"), ExecutedInstruction);
+								Access->SetNumberField(TEXT("nextInstruction"), State.nextInstruction);
+								const FString InstructionText = DisassemblyTextByInstruction.FindRef(TextureInstruction);
+								Access->SetStringField(TEXT("disassembly"), InstructionText);
+								if (const int32* SourceLine = DisassemblyLineByInstruction.Find(TextureInstruction))
+								{
+									Access->SetNumberField(TEXT("disassemblyLine"), *SourceLine);
+								}
+
+								TSet<FString> ReferencedNames;
+								FRegexMatcher VariableMatcher(FRegexPattern(TEXT("(_+[A-Za-z0-9_\\.]+)")), InstructionText);
+								while (VariableMatcher.FindNext())
+								{
+									ReferencedNames.Add(VariableMatcher.GetCaptureGroup(1));
+								}
+								TArray<TSharedPtr<FJsonValue>> Variables;
+								for (const FString& Name : ReferencedNames)
+								{
+									if (const ShaderVariable* Variable = LiveVariables.Find(Name))
+									{
+										Variables.Add(MakeShared<FJsonValueObject>(SerializeShaderVariable(*Variable, 0)));
+									}
+								}
+								Access->SetArrayField(TEXT("variables"), MoveTemp(Variables));
+								TextureAccesses.Add(MakeShared<FJsonValueObject>(Access));
+							}
+						}
 						MaxCallstackDepth = FMath::Max(MaxCallstackDepth, static_cast<int32>(State.callstack.size()));
 						LastStateSnapshot = SerializeStateSnapshot(State);
 						if (!FirstStateSnapshot.IsValid())
@@ -1464,6 +1833,8 @@ namespace UE::RenderTrail::Private
 						break;
 					}
 				}
+				EmitDiagnostic(TEXT("shader_debug.continue"), TEXT("end"), ContinueStartSeconds,
+					FString::Printf(TEXT("steps=%d completed=%s"), StepCount, bCompleted ? TEXT("true") : TEXT("false")), RequestId);
 			}
 			Object->SetNumberField(TEXT("stepCount"), StepCount);
 			Object->SetBoolField(TEXT("completed"), bCompleted);
@@ -1479,22 +1850,35 @@ namespace UE::RenderTrail::Private
 			}
 			Object->SetArrayField(TEXT("traceStateSamples"), MoveTemp(TraceStateSamples));
 			Object->SetArrayField(TEXT("stepFlags"), MoveTemp(StepFlags));
+			Object->SetArrayField(TEXT("textureAccesses"), MoveTemp(TextureAccesses));
 			Object->SetObjectField(TEXT("shaderCodeEvidence"),
 				BuildShaderCodeEvidence(ShaderDisassembly, ObservedInstructionLines));
 			Controller->FreeTrace(Trace);
 			Emit(Object);
 			if (FinalEventId > 0)
 			{
+				const double RestoreStartSeconds = FPlatformTime::Seconds();
+				EmitDiagnostic(TEXT("shader_debug.restore_frame_event"), TEXT("begin"), RestoreStartSeconds,
+					FString::Printf(TEXT("eventId=%u force=true"), FinalEventId), RequestId);
 				Controller->SetFrameEvent(FinalEventId, true);
+				EmitDiagnostic(TEXT("shader_debug.restore_frame_event"), TEXT("end"), RestoreStartSeconds,
+					FString::Printf(TEXT("eventId=%u"), FinalEventId), RequestId);
 			}
+			EmitDiagnostic(TEXT("shader_debug"), TEXT("end"), QueryStartSeconds,
+				FString::Printf(TEXT("eventId=%u steps=%d"), EventId, StepCount), RequestId);
 		}
 
 		void Shutdown()
 		{
 			if (Controller)
 			{
+				const double ShutdownStartSeconds = FPlatformTime::Seconds();
+				EmitDiagnostic(TEXT("replay_controller_shutdown"), TEXT("begin"), ShutdownStartSeconds,
+					TEXT("Calling IReplayController::Shutdown"));
 				Controller->Shutdown();
 				Controller = nullptr;
+				EmitDiagnostic(TEXT("replay_controller_shutdown"), TEXT("end"), ShutdownStartSeconds,
+					TEXT("Replay controller released"));
 			}
 			ActionNames.Empty();
 			ActionKinds.Empty();
@@ -1514,7 +1898,7 @@ namespace UE::RenderTrail::Private
 	public:
 		void Emit(const TSharedRef<FJsonObject>& Object) const
 		{
-			Object->SetNumberField(TEXT("protocolVersion"), ProtocolVersion);
+			Object->SetNumberField(TEXT("protocolVersion"), ReplayWorkerProtocolVersion);
 			if (MessageCallback)
 			{
 				MessageCallback(SerializeJson(Object));
@@ -1527,6 +1911,25 @@ namespace UE::RenderTrail::Private
 			Object->SetStringField(TEXT("type"), TEXT("error"));
 			Object->SetStringField(TEXT("stage"), Stage);
 			Object->SetStringField(TEXT("message"), Message);
+			if (!RequestId.IsEmpty())
+			{
+				Object->SetStringField(TEXT("requestId"), RequestId);
+			}
+			Emit(Object);
+		}
+
+		void EmitDiagnostic(const FString& Stage, const FString& State, double StageStartSeconds,
+			const FString& Detail, const FString& RequestId = FString()) const
+		{
+			const double Now = FPlatformTime::Seconds();
+			const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetStringField(TEXT("type"), TEXT("diagnostic"));
+			Object->SetStringField(TEXT("stage"), Stage);
+			Object->SetStringField(TEXT("state"), State);
+			Object->SetStringField(TEXT("detail"), Detail);
+			Object->SetNumberField(TEXT("stageElapsedSeconds"), FMath::Max(0.0, Now - StageStartSeconds));
+			Object->SetNumberField(TEXT("sessionElapsedSeconds"),
+				SessionStartSeconds > 0.0 ? FMath::Max(0.0, Now - SessionStartSeconds) : 0.0);
 			if (!RequestId.IsEmpty())
 			{
 				Object->SetStringField(TEXT("requestId"), RequestId);
@@ -1594,9 +1997,13 @@ namespace UE::RenderTrail::Private
 			}
 
 			const double StartSeconds = FPlatformTime::Seconds();
+			EmitDiagnostic(TEXT("action_index"), TEXT("begin"), StartSeconds,
+				TEXT("Reading root actions and structured file labels"));
 			const rdcarray<ActionDescription>& Actions = Controller->GetRootActions();
 			IndexActions(Actions, Controller->GetStructuredFile(), ActionNames, ActionKinds, ActionPaths, ActionFlagsByEvent);
 			bActionIndexBuilt = true;
+			EmitDiagnostic(TEXT("action_index"), TEXT("end"), StartSeconds,
+				FString::Printf(TEXT("events=%d"), ActionNames.Num()));
 			UE_LOG(LogRenderTrailReplayWorker, Display,
 				TEXT("Deferred action index built: events=%d elapsed=%.3fs"),
 				ActionNames.Num(), FPlatformTime::Seconds() - StartSeconds);
@@ -1612,11 +2019,15 @@ namespace UE::RenderTrail::Private
 		FString CapturePath;
 		FString PreviewPath;
 		FString TargetName;
+		FString TargetFormat;
 		FString RenderDocVersion;
 		FString RenderDocCommit;
 		TFunction<void(const FString&)> MessageCallback;
+		double SessionStartSeconds = 0.0;
 		ResourceId TargetTexture;
 		CompType TargetCompType = CompType::Typeless;
+		int32 TargetResourceIndex = INDEX_NONE;
+		uint32 TargetSamples = 1;
 		uint32 Width = 0;
 		uint32 Height = 0;
 		uint32 FinalEventId = 0;
@@ -1629,6 +2040,7 @@ namespace UE::RenderTrail::Private
 		TMap<uint32, FString> ActionPaths;
 		TMap<uint32, uint32> ActionFlagsByEvent;
 		static constexpr int32 MaxSerializedEventResources = 16;
+		static constexpr int32 MaxSerializedTextureAccesses = 64;
 		static constexpr int32 MaxShaderDebugSteps = 4096;
 		static constexpr int32 FullDiagnosticsShaderDebugSteps = 65536;
 	};
@@ -1679,11 +2091,13 @@ namespace UE::RenderTrail::Replay
 		#endif
 	}
 
-	void QueryPixelHistory(uint32 X, uint32 Y, const FString& RequestId)
+	void QueryPixelHistory(uint32 X, uint32 Y, int32 ResourceIndex, uint32 Mip, uint32 Slice,
+		uint32 SampleIndex, uint32 BeforeEventId, int32 TypeCastOverride, const FString& RequestId)
 	{
 		if (GSession)
 		{
-			GSession->QueryPixelHistory(X, Y, RequestId);
+			GSession->QueryPixelHistory(X, Y, ResourceIndex, Mip, Slice, SampleIndex,
+				BeforeEventId, TypeCastOverride, RequestId);
 		}
 	}
 
@@ -1695,12 +2109,12 @@ namespace UE::RenderTrail::Replay
 		}
 	}
 
-	void QueryShaderDebug(uint32 EventId, uint32 X, uint32 Y, uint32 PrimitiveId, bool bHasPrimitive,
+	void QueryShaderDebug(uint32 EventId, uint32 X, uint32 Y, int32 SampleIndex, uint32 PrimitiveId, bool bHasPrimitive,
 		const FString& RequestId)
 	{
 		if (GSession)
 		{
-			GSession->QueryShaderDebug(EventId, X, Y, PrimitiveId, bHasPrimitive, RequestId);
+			GSession->QueryShaderDebug(EventId, X, Y, SampleIndex, PrimitiveId, bHasPrimitive, RequestId);
 		}
 	}
 
@@ -1738,7 +2152,21 @@ namespace
 		{
 			Object->SetStringField(TEXT("requestId"), RequestId);
 		}
-		Object->SetNumberField(TEXT("protocolVersion"), UE::RenderTrail::ProtocolVersion);
+		Object->SetNumberField(TEXT("protocolVersion"), UE::RenderTrail::ReplayWorkerProtocolVersion);
+		WriteProtocolLine(UE::RenderTrail::Private::SerializeJson(Object));
+	}
+
+	static void WriteProtocolDiagnostic(const TCHAR* Stage, const TCHAR* State,
+		double StageStartSeconds, const FString& Detail)
+	{
+		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+		Object->SetStringField(TEXT("type"), TEXT("diagnostic"));
+		Object->SetStringField(TEXT("stage"), Stage);
+		Object->SetStringField(TEXT("state"), State);
+		Object->SetStringField(TEXT("detail"), Detail);
+		Object->SetNumberField(TEXT("stageElapsedSeconds"),
+			FMath::Max(0.0, FPlatformTime::Seconds() - StageStartSeconds));
+		Object->SetNumberField(TEXT("protocolVersion"), UE::RenderTrail::ReplayWorkerProtocolVersion);
 		WriteProtocolLine(UE::RenderTrail::Private::SerializeJson(Object));
 	}
 
@@ -1749,14 +2177,25 @@ namespace
 			? static_cast<int32>(FMath::Max(0.0, Value))
 			: 0;
 	}
+
+	static int32 ReadInt32(const TSharedPtr<FJsonObject>& Object, const TCHAR* Field, int32 DefaultValue = 0)
+	{
+		double Value = 0.0;
+		return Object.IsValid() && Object->TryGetNumberField(Field, Value)
+			? static_cast<int32>(Value)
+			: DefaultValue;
+	}
 }
 
 	IMPLEMENT_APPLICATION(RenderTrailReplayWorker, "RenderTrailReplayWorker");
 
-INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
-{
-	int32 ReturnCode = EXIT_SUCCESS;
-	GEngineLoop.PreInit(ArgC, ArgV);
+	INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
+	{
+		int32 ReturnCode = EXIT_SUCCESS;
+		const double PreInitStartSeconds = FPlatformTime::Seconds();
+		GEngineLoop.PreInit(ArgC, ArgV);
+		WriteProtocolDiagnostic(TEXT("worker_preinit"), TEXT("end"), PreInitStartSeconds,
+			TEXT("GEngineLoop.PreInit completed"));
 
 	FString CapturePath;
 	FString PreviewPath;
@@ -1813,6 +2252,12 @@ INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
 					UE::RenderTrail::Replay::QueryPixelHistory(
 						static_cast<uint32>(ReadUInt32(Request, TEXT("x"))),
 						static_cast<uint32>(ReadUInt32(Request, TEXT("y"))),
+						ReadInt32(Request, TEXT("resourceIndex"), INDEX_NONE),
+						static_cast<uint32>(ReadUInt32(Request, TEXT("mip"))),
+						static_cast<uint32>(ReadUInt32(Request, TEXT("slice"))),
+						static_cast<uint32>(ReadUInt32(Request, TEXT("sample"))),
+						static_cast<uint32>(ReadUInt32(Request, TEXT("beforeEventId"))),
+						ReadInt32(Request, TEXT("typeCast"), INDEX_NONE),
 						RequestId);
 				}
 				else if (Command == TEXT("event_context"))
@@ -1828,6 +2273,7 @@ INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
 						static_cast<uint32>(ReadUInt32(Request, TEXT("eventId"))),
 						static_cast<uint32>(ReadUInt32(Request, TEXT("x"))),
 						static_cast<uint32>(ReadUInt32(Request, TEXT("y"))),
+						ReadInt32(Request, TEXT("sample"), -1),
 						static_cast<uint32>(ReadUInt32(Request, TEXT("primitiveId"))),
 						bHasPrimitive,
 						RequestId);
@@ -1840,8 +2286,18 @@ INT32_MAIN_INT32_ARGC_TCHAR_ARGV()
 		}
 	}
 
+	const double SessionShutdownStartSeconds = FPlatformTime::Seconds();
+	WriteProtocolDiagnostic(TEXT("worker_session_shutdown"), TEXT("begin"), SessionShutdownStartSeconds,
+		TEXT("Releasing Replay Controller and session state"));
 	UE::RenderTrail::Replay::Shutdown();
+	WriteProtocolDiagnostic(TEXT("worker_session_shutdown"), TEXT("end"), SessionShutdownStartSeconds,
+		TEXT("Replay session released"));
+	const double RenderDocShutdownStartSeconds = FPlatformTime::Seconds();
+	WriteProtocolDiagnostic(TEXT("renderdoc_runtime_shutdown"), TEXT("begin"), RenderDocShutdownStartSeconds,
+		TEXT("Calling RENDERDOC_ShutdownReplay"));
 	UE::RenderTrail::Replay::ShutdownRenderDoc();
+	WriteProtocolDiagnostic(TEXT("renderdoc_runtime_shutdown"), TEXT("end"), RenderDocShutdownStartSeconds,
+		TEXT("RenderDoc replay runtime shut down"));
 	FEngineLoop::AppPreExit();
 	FModuleManager::Get().UnloadModulesAtShutdown();
 	FEngineLoop::AppExit();
