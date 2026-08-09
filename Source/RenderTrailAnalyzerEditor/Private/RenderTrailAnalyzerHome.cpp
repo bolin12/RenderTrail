@@ -1794,6 +1794,11 @@ namespace UE::RenderTrail::Private
 			{
 				Compact->SetArrayField(TEXT("confirmedWriterEventIds"), *WriterIds);
 			}
+			const TSharedPtr<FJsonObject>* ShaderAccessResult = nullptr;
+			if (History->TryGetObjectField(TEXT("shaderAccessResult"), ShaderAccessResult) && ShaderAccessResult)
+			{
+				Compact->SetObjectField(TEXT("shaderAccessResult"), *ShaderAccessResult);
+			}
 
 			const TArray<TSharedPtr<FJsonValue>>* EventSummaries = nullptr;
 			TArray<TSharedPtr<FJsonValue>> CompactEvents;
@@ -2167,10 +2172,24 @@ namespace UE::RenderTrail::Private
 					BranchJson->SetNumberField(TEXT("consumerEventId"), Branch.ConsumerEventId);
 					BranchJson->SetNumberField(TEXT("producerEventId"), Branch.ProducerEventId);
 					BranchJson->SetNumberField(TEXT("resetBoundaryEventId"), Branch.ResetBoundaryEventId);
+					BranchJson->SetNumberField(TEXT("resourceIndex"), Branch.ResourceIndex);
 					BranchJson->SetNumberField(TEXT("reverseDepth"), Branch.ReverseDepth);
 					BranchJson->SetStringField(TEXT("resource"), Branch.ResourceName);
+					BranchJson->SetStringField(TEXT("shaderBinding"), Branch.ShaderBinding);
+					BranchJson->SetStringField(TEXT("resourceAccess"), Branch.ResourceAccess);
 					BranchJson->SetStringField(TEXT("branchStatus"), Branch.BranchStatus);
 					BranchJson->SetStringField(TEXT("mappingConfidence"), Branch.MappingConfidence);
+					BranchJson->SetStringField(TEXT("edgeRole"), Branch.EdgeRole);
+					BranchJson->SetStringField(TEXT("edgeConfidence"), Branch.EdgeConfidence);
+					BranchJson->SetStringField(TEXT("executedSampleValue"), Branch.ExecutedSampleValue);
+					BranchJson->SetStringField(TEXT("producerBeforeValue"), Branch.ProducerBeforeValue);
+					BranchJson->SetStringField(TEXT("producerShaderOutputValue"), Branch.ProducerShaderOutputValue);
+					BranchJson->SetStringField(TEXT("producerWrittenValue"), Branch.ProducerWrittenValue);
+					BranchJson->SetStringField(TEXT("producerWrittenValueSource"), TEXT("Pixel History lastAfter/postMod"));
+					BranchJson->SetStringField(TEXT("producerActionKind"), Branch.ProducerActionKind);
+					BranchJson->SetBoolField(TEXT("executedShaderAccess"), Branch.bExecutedShaderAccess);
+					BranchJson->SetBoolField(TEXT("producerChangedValue"), Branch.bProducerChangedValue);
+					BranchJson->SetBoolField(TEXT("producerValueMatchesExecutedSample"), Branch.bProducerValueMatchesExecutedSample);
 					BranchJson->SetNumberField(TEXT("evidenceRecordCount"), Branch.EvidenceRecordCount);
 					BranchJson->SetNumberField(TEXT("queryRecordCount"), Branch.QueryRecordCount);
 					BranchJson->SetNumberField(TEXT("collapsedShaderAccessCount"), Branch.CollapsedShaderAccessCount);
@@ -2201,6 +2220,32 @@ namespace UE::RenderTrail::Private
 			Root->SetArrayField(TEXT("causalLanes"), MoveTemp(CausalLaneValues));
 			Root->SetStringField(TEXT("causalLanePolicy"),
 				TEXT("color, geometry, and overlay are parallel evidence lanes; never concatenate them into one chronological process"));
+			const uint32 PrimaryRootEventId = LastCandidate.IsSet() ? LastCandidate->Event.EventId : 0;
+			const FPrimaryCausalPathEvidence PrimaryPath = BuildPrimaryColorPathEvidence(
+				CausalLanes, EventContexts, PrimaryRootEventId);
+			const TSharedRef<FJsonObject> PrimaryPathJson = MakeShared<FJsonObject>();
+			PrimaryPathJson->SetNumberField(TEXT("rootEventId"), PrimaryPath.RootEventId);
+			PrimaryPathJson->SetStringField(TEXT("stopReason"), PrimaryPath.StopReason);
+			PrimaryPathJson->SetBoolField(TEXT("reachedConfirmedSceneSource"), PrimaryPath.bReachedConfirmedSceneSource);
+			PrimaryPathJson->SetBoolField(TEXT("reachedExplicitBoundary"), PrimaryPath.bReachedExplicitBoundary);
+			TArray<TSharedPtr<FJsonValue>> PrimaryPathEdges;
+			for (const FCausalLaneBranchEvidence& Branch : PrimaryPath.Branches)
+			{
+				const TSharedRef<FJsonObject> Edge = MakeShared<FJsonObject>();
+				Edge->SetNumberField(TEXT("consumerEventId"), Branch.ConsumerEventId);
+				Edge->SetNumberField(TEXT("producerEventId"), Branch.ProducerEventId);
+				Edge->SetNumberField(TEXT("resourceIndex"), Branch.ResourceIndex);
+				Edge->SetStringField(TEXT("resource"), Branch.ResourceName);
+				Edge->SetStringField(TEXT("lane"), Branch.TracePurpose);
+				Edge->SetStringField(TEXT("edgeRole"), Branch.EdgeRole);
+				Edge->SetStringField(TEXT("edgeConfidence"), Branch.EdgeConfidence);
+				Edge->SetStringField(TEXT("executedSampleValue"), Branch.ExecutedSampleValue);
+				Edge->SetStringField(TEXT("producerWrittenValue"), Branch.ProducerWrittenValue);
+				Edge->SetStringField(TEXT("branchStatus"), Branch.BranchStatus);
+				PrimaryPathEdges.Add(MakeShared<FJsonValueObject>(Edge));
+			}
+			PrimaryPathJson->SetArrayField(TEXT("edges"), MoveTemp(PrimaryPathEdges));
+			Root->SetObjectField(TEXT("primaryColorPath"), PrimaryPathJson);
 
 			if (LastCandidate.IsSet())
 			{
@@ -3083,6 +3128,113 @@ namespace UE::RenderTrail::Private
 			const TArray<FCausalLaneEvidence> EvidenceLanes =
 				BuildCausalLaneEvidence(EventContexts, EventContextDepths);
 			TArray<FRenderTrailResultLane> Result;
+			auto RoleText = [](const FString& Role)
+			{
+				if (Role == TEXT("value-changing-producer")) return FString(TEXT("改变数值的 producer"));
+				if (Role == TEXT("pass-through-producer")) return FString(TEXT("无变化传递 producer"));
+				if (Role == TEXT("neutral-input")) return FString(TEXT("本像素中性/零值输入"));
+				if (Role == TEXT("geometry-owner")) return FString(TEXT("几何/可见性 owner"));
+				if (Role == TEXT("external-history-boundary")) return FString(TEXT("捕获外历史边界"));
+				if (Role == TEXT("consumer-read-write-output")) return FString(TEXT("consumer 的读写输出，不作为上游输入"));
+				if (Role == TEXT("reset-boundary")) return FString(TEXT("ownership reset"));
+				if (Role == TEXT("budget-boundary")) return FString(TEXT("预算边界"));
+				return Role.IsEmpty() ? FString(TEXT("未分类边")) : Role;
+			};
+		auto MakeBranchNode = [&RoleText](const FCausalLaneBranchEvidence& Branch)
+			{
+				FRenderTrailResultNode Node;
+				if (Branch.ProducerEventId == 0 && Branch.ResetBoundaryEventId == 0)
+				{
+					Node.State = ERenderTrailResultNodeState::Blocked;
+				}
+				else if (Branch.EdgeConfidence.StartsWith(TEXT("confirmed")))
+				{
+					Node.State = ERenderTrailResultNodeState::Confirmed;
+				}
+				else if (Branch.EdgeRole == TEXT("neutral-input")
+					|| Branch.EdgeRole == TEXT("consumer-read-write-output"))
+				{
+					Node.State = ERenderTrailResultNodeState::Information;
+				}
+				else
+				{
+					Node.State = ERenderTrailResultNodeState::Candidate;
+				}
+				const FString ResourceIdentity = Branch.ResourceIndex != INDEX_NONE
+					? FString::Printf(TEXT("%s [R%d]"), *Branch.ResourceName, Branch.ResourceIndex)
+					: Branch.ResourceName;
+				if (Branch.ProducerEventId > 0)
+				{
+					Node.Title = FString::Printf(TEXT("EID %u ← %s ← EID %u"),
+						Branch.ConsumerEventId, *ResourceIdentity, Branch.ProducerEventId);
+				}
+				else if (Branch.ResetBoundaryEventId > 0)
+				{
+					Node.Title = FString::Printf(TEXT("EID %u ← %s ← reset EID %u"),
+						Branch.ConsumerEventId, *ResourceIdentity, Branch.ResetBoundaryEventId);
+				}
+				else
+				{
+					Node.Title = FString::Printf(TEXT("EID %u ← %s ← 边界"),
+						Branch.ConsumerEventId, *ResourceIdentity);
+				}
+				Node.Subtitle = FString::Printf(TEXT("%s · confidence=%s · mapping=%s · status=%s"),
+					*RoleText(Branch.EdgeRole),
+					Branch.EdgeConfidence.IsEmpty() ? TEXT("unknown") : *Branch.EdgeConfidence,
+					Branch.MappingConfidence.IsEmpty() ? TEXT("unknown") : *Branch.MappingConfidence,
+					Branch.BranchStatus.IsEmpty() ? TEXT("unknown") : *Branch.BranchStatus);
+				if (!Branch.ExecutedSampleValue.IsEmpty())
+				{
+					Node.Subtitle += TEXT("\n执行采样值：") + Branch.ExecutedSampleValue;
+				}
+				if (!Branch.ProducerWrittenValue.IsEmpty())
+				{
+					Node.Subtitle += TEXT("\nproducer 写入值（lastAfter/postMod）：") + Branch.ProducerWrittenValue;
+				}
+				return Node;
+			};
+		auto BranchLine = [&RoleText](const FCausalLaneBranchEvidence& Branch)
+			{
+				const FString Source = Branch.ProducerEventId > 0
+					? FString::Printf(TEXT("EID %u"), Branch.ProducerEventId)
+					: (Branch.ResetBoundaryEventId > 0
+						? FString::Printf(TEXT("reset EID %u"), Branch.ResetBoundaryEventId)
+						: TEXT("边界"));
+				return FString::Printf(TEXT("EID %u ← %s [R%d] ← %s；%s；confidence=%s；mapping=%s；sample=%s；written=%s\n"),
+					Branch.ConsumerEventId, *Branch.ResourceName, Branch.ResourceIndex, *Source,
+					*RoleText(Branch.EdgeRole),
+					Branch.EdgeConfidence.IsEmpty() ? TEXT("unknown") : *Branch.EdgeConfidence,
+					Branch.MappingConfidence.IsEmpty() ? TEXT("unknown") : *Branch.MappingConfidence,
+					Branch.ExecutedSampleValue.IsEmpty() ? TEXT("unknown") : *Branch.ExecutedSampleValue,
+					Branch.ProducerWrittenValue.IsEmpty() ? TEXT("unknown") : *Branch.ProducerWrittenValue);
+			};
+
+			const uint32 RootEventId = LastCandidate.IsSet() ? LastCandidate->Event.EventId : 0;
+			const FPrimaryCausalPathEvidence PrimaryPath = BuildPrimaryColorPathEvidence(
+				EvidenceLanes, EventContexts, RootEventId);
+			if (RootEventId > 0)
+			{
+				FRenderTrailResultLane PrimaryLane;
+				PrimaryLane.Kind = TEXT("primary-color-path");
+				PrimaryLane.Title = TEXT("最终颜色主形成路径");
+				PrimaryLane.Summary = FString::Printf(
+					TEXT("从最终物理写入 EID %u 沿已执行颜色读取反向连接；当前在 %s 收束。辅助 Bloom、曝光、LUT、覆盖与几何分支在下方独立展示。"),
+					RootEventId, PrimaryPath.StopReason.IsEmpty() ? TEXT("unknown") : *PrimaryPath.StopReason);
+				for (const FCausalLaneBranchEvidence& Branch : PrimaryPath.Branches)
+				{
+					PrimaryLane.Nodes.Add(MakeBranchNode(Branch));
+				}
+				if (PrimaryLane.Nodes.IsEmpty())
+				{
+					FRenderTrailResultNode Boundary;
+					Boundary.State = ERenderTrailResultNodeState::Blocked;
+					Boundary.Title = FString::Printf(TEXT("EID %u ← 未找到可连接的已执行颜色输入"), RootEventId);
+					Boundary.Subtitle = PrimaryPath.StopReason;
+					PrimaryLane.Nodes.Add(MoveTemp(Boundary));
+				}
+				Result.Add(MoveTemp(PrimaryLane));
+			}
+
 			for (const FCausalLaneEvidence& EvidenceLane : EvidenceLanes)
 			{
 				FRenderTrailResultLane Lane;
@@ -3091,12 +3243,44 @@ namespace UE::RenderTrail::Private
 					? TEXT("几何 / 可见性归属线")
 					: (EvidenceLane.TracePurpose == TEXT("overlay")
 						? TEXT("编辑器覆盖层线") : TEXT("颜色形成线"));
-				const int32 DisplayedBranches = FMath::Min(EvidenceLane.Branches.Num(), MaxDisplayedResultLaneBranches);
+				TArray<const FCausalLaneBranchEvidence*> OrderedBranches;
+				for (const FCausalLaneBranchEvidence& Branch : EvidenceLane.Branches)
+				{
+					OrderedBranches.Add(&Branch);
+				}
+				OrderedBranches.Sort([&PrimaryPath](const FCausalLaneBranchEvidence& A,
+					const FCausalLaneBranchEvidence& B)
+				{
+					auto Score = [&PrimaryPath](const FCausalLaneBranchEvidence& Branch)
+					{
+						int32 Value = 0;
+						Value += PrimaryPath.Branches.ContainsByPredicate([&Branch](const FCausalLaneBranchEvidence& PathBranch)
+						{
+							return PathBranch.ConsumerEventId == Branch.ConsumerEventId
+								&& PathBranch.ResourceIndex == Branch.ResourceIndex
+								&& PathBranch.ProducerEventId == Branch.ProducerEventId;
+						}) ? 1000 : 0;
+						Value += Branch.EdgeConfidence.StartsWith(TEXT("confirmed")) ? 160
+							: (Branch.EdgeConfidence.StartsWith(TEXT("strong")) ? 100 : 0);
+						Value += Branch.ProducerEventId > 0 ? 80 : 0;
+						Value -= Branch.EdgeRole == TEXT("neutral-input") ? 120 : 0;
+						Value -= Branch.EdgeRole == TEXT("consumer-read-write-output") ? 220 : 0;
+						Value -= Branch.ResourceName.Contains(TEXT("BlackDummy"), ESearchCase::IgnoreCase) ? 160 : 0;
+						Value -= Branch.ReverseDepth * 3;
+						return Value;
+					};
+					const int32 AScore = Score(A);
+					const int32 BScore = Score(B);
+					if (AScore != BScore) return AScore > BScore;
+					if (A.ConsumerEventId != B.ConsumerEventId) return A.ConsumerEventId > B.ConsumerEventId;
+					return A.ResourceIndex < B.ResourceIndex;
+				});
+				const int32 DisplayedBranches = FMath::Min(OrderedBranches.Num(), MaxDisplayedResultLaneBranches);
 				Lane.Summary = FString::Printf(
-					TEXT("%d 个去重分支：%d 个 producer、%d 个 reset、%d 个未完成边界；由 %d 条分支记录归并，其中 %d 条实际执行 Pixel History。显示 %d/%d。%s"),
+					TEXT("%d 个去重分支：%d 个 producer、%d 个 reset、%d 个未完成边界；%d 条实际 Pixel History。优先显示 %d/%d，其余可在卡片内展开。%s"),
 					EvidenceLane.Branches.Num(), EvidenceLane.ConfirmedProducerCount,
 					EvidenceLane.ResetBoundaryCount, EvidenceLane.UnresolvedBoundaryCount,
-					EvidenceLane.EvidenceRecordCount, EvidenceLane.QueryRecordCount,
+					EvidenceLane.QueryRecordCount,
 					DisplayedBranches, EvidenceLane.Branches.Num(),
 					EvidenceLane.TracePurpose == TEXT("geometry")
 						? TEXT("该线证明几何归属，不等同于最终 RGB 贡献。")
@@ -3104,56 +3288,13 @@ namespace UE::RenderTrail::Private
 
 				for (int32 BranchIndex = 0; BranchIndex < DisplayedBranches; ++BranchIndex)
 				{
-					const FCausalLaneBranchEvidence& Branch = EvidenceLane.Branches[BranchIndex];
-					FString SampleText;
-					for (int32 SampleIndex = 0; SampleIndex < Branch.Samples.Num(); ++SampleIndex)
-					{
-						SampleText += FString::FromInt(Branch.Samples[SampleIndex]);
-						if (SampleIndex + 1 < Branch.Samples.Num()) SampleText += TEXT(",");
-					}
-
-					FRenderTrailResultNode Node;
-					if (Branch.ProducerEventId > 0)
-					{
-						Node.State = EvidenceLane.TracePurpose == TEXT("geometry")
-							? ERenderTrailResultNodeState::Confirmed : ERenderTrailResultNodeState::Candidate;
-						Node.Title = FString::Printf(TEXT("EID %u ← %s ← EID %u"),
-							Branch.ConsumerEventId, *Branch.ResourceName, Branch.ProducerEventId);
-						FString ProducerDescription;
-						if (const FEventContextEvidence* Producer = EventContexts.Find(Branch.ProducerEventId))
-						{
-							ProducerDescription = CompactMarkerPath(Producer->MarkerPath).Left(180);
-							if (ProducerDescription.IsEmpty()) ProducerDescription = Producer->Action;
-						}
-						Node.Subtitle = FString::Printf(
-							TEXT("samples=%s · %d 条记录/%d 条查询归并 · mapping=%s · %s%s"),
-							SampleText.IsEmpty() ? TEXT("unknown") : *SampleText,
-							Branch.EvidenceRecordCount, Branch.QueryRecordCount,
-							Branch.MappingConfidence.IsEmpty() ? TEXT("unknown") : *Branch.MappingConfidence,
-							*Branch.BranchStatus,
-							ProducerDescription.IsEmpty() ? TEXT("") : *FString::Printf(TEXT("\nproducer: %s"), *ProducerDescription));
-					}
-					else if (Branch.ResetBoundaryEventId > 0)
-					{
-						Node.State = ERenderTrailResultNodeState::Confirmed;
-						Node.Title = FString::Printf(TEXT("EID %u ← %s ← reset EID %u"),
-							Branch.ConsumerEventId, *Branch.ResourceName, Branch.ResetBoundaryEventId);
-						Node.Subtitle = TEXT("已确认的 ownership reset；不是 Mesh producer。");
-					}
-					else
-					{
-						Node.State = Branch.BranchStatus.Contains(TEXT("adaptive"), ESearchCase::IgnoreCase)
-							? ERenderTrailResultNodeState::Candidate : ERenderTrailResultNodeState::Blocked;
-						Node.Title = FString::Printf(TEXT("EID %u ← %s ← 未确认 producer"),
-							Branch.ConsumerEventId, *Branch.ResourceName);
-						Node.Subtitle = FString::Printf(TEXT("samples=%s · %d 条记录/%d 条查询归并 · status=%s · mapping=%s"),
-							SampleText.IsEmpty() ? TEXT("unknown") : *SampleText,
-							Branch.EvidenceRecordCount, Branch.QueryRecordCount,
-							Branch.BranchStatus.IsEmpty() ? TEXT("unknown") : *Branch.BranchStatus,
-							Branch.MappingConfidence.IsEmpty() ? TEXT("unknown") : *Branch.MappingConfidence);
-					}
-					Lane.Nodes.Add(MoveTemp(Node));
+					Lane.Nodes.Add(MakeBranchNode(*OrderedBranches[BranchIndex]));
 				}
+				for (const FCausalLaneBranchEvidence* Branch : OrderedBranches)
+				{
+					Lane.FullEvidenceText += BranchLine(*Branch);
+				}
+				Lane.FullEvidenceTitle = FString::Printf(TEXT("查看全部 %d 个确定性分支"), OrderedBranches.Num());
 				Result.Add(MoveTemp(Lane));
 			}
 			return Result;
@@ -3308,7 +3449,7 @@ namespace UE::RenderTrail::Private
 				for (int32 Index = 0; Index < Process->Num(); ++Index)
 					ProcessText += FString::Printf(TEXT("%d. %s\n"), Index + 1, *(*Process)[Index]->AsString());
 			}
-			FString AgentLaneText;
+			FString AgentLaneSummaryText;
 			const TArray<TSharedPtr<FJsonValue>>* AgentLanes = nullptr;
 			if (Final->TryGetArrayField(TEXT("lanes"), AgentLanes) && AgentLanes)
 			{
@@ -3322,18 +3463,31 @@ namespace UE::RenderTrail::Private
 					Lane->TryGetStringField(TEXT("kind"), Kind);
 					Lane->TryGetStringField(TEXT("status"), Status);
 					Lane->TryGetStringField(TEXT("summary"), LaneSummary);
-					AgentLaneText += FString::Printf(TEXT("[%s · %s] %s\n"), *Kind, *Status, *LaneSummary);
-					const TArray<TSharedPtr<FJsonValue>>* Steps = nullptr;
-					if (Lane->TryGetArrayField(TEXT("steps"), Steps) && Steps)
-					{
-						for (const TSharedPtr<FJsonValue>& Step : *Steps)
-						{
-							if (Step.IsValid() && Step->Type == EJson::String)
-							{
-								AgentLaneText += TEXT("  • ") + Step->AsString() + TEXT("\n");
-							}
-						}
-					}
+					AgentLaneSummaryText += FString::Printf(TEXT("[%s · %s] %s\n"), *Kind, *Status, *LaneSummary);
+				}
+			}
+			const TArray<FRenderTrailResultLane> DeterministicResultLanes = BuildDeterministicResultLanes();
+			// The final-RT process is also deterministic. Model-provided process text may summarize
+			// language, but it must not introduce cross-resource or cross-lane edges.
+			ProcessText.Empty();
+			if (LastCandidate.IsSet())
+			{
+				const FEventEvidence& FinalWriter = LastCandidate->Event;
+				ProcessText = FString::Printf(TEXT("1. EID %u · %s：最终目标物理写入；before=%s；after=%s；change=%s\n"),
+					FinalWriter.EventId, *CompactMarkerPath(FinalWriter.MarkerPath),
+					FinalWriter.Before.IsEmpty() ? TEXT("unknown") : *FinalWriter.Before,
+					FinalWriter.After.IsEmpty() ? TEXT("unknown") : *FinalWriter.After,
+					*ClassifyColorDelta(FinalWriter));
+			}
+			FString DeterministicLaneText;
+			for (const FRenderTrailResultLane& Lane : DeterministicResultLanes)
+			{
+				DeterministicLaneText += FString::Printf(TEXT("[%s] %s\n"), *Lane.Title, *Lane.Summary);
+				for (const FRenderTrailResultNode& Node : Lane.Nodes)
+				{
+					DeterministicLaneText += TEXT("  • ") + Node.Title;
+					if (!Node.Subtitle.IsEmpty()) DeterministicLaneText += TEXT("；") + Node.Subtitle.Replace(TEXT("\n"), TEXT("；"));
+					DeterministicLaneText += TEXT("\n");
 				}
 			}
 			FString UnknownText;
@@ -3342,6 +3496,100 @@ namespace UE::RenderTrail::Private
 			{
 				for (const TSharedPtr<FJsonValue>& Unknown : *Unknowns)
 					UnknownText += FString::Printf(TEXT("• %s\n"), *Unknown->AsString());
+			}
+
+			// Promote deterministic topology and values above model prose. The Agent may summarize
+			// these facts, but it cannot redefine the final writer, primary path, mesh owner, or gaps.
+			const TArray<FCausalLaneEvidence> DeterministicEvidenceLanes =
+				BuildCausalLaneEvidence(EventContexts, EventContextDepths);
+			const uint32 DeterministicRootEventId = LastCandidate.IsSet() ? LastCandidate->Event.EventId : 0;
+			const FPrimaryCausalPathEvidence DeterministicPrimaryPath = BuildPrimaryColorPathEvidence(
+				DeterministicEvidenceLanes, EventContexts, DeterministicRootEventId);
+			FString PrimaryPathText;
+			for (const FCausalLaneBranchEvidence& Branch : DeterministicPrimaryPath.Branches)
+			{
+				if (PrimaryPathText.IsEmpty())
+				{
+					PrimaryPathText = FString::Printf(TEXT("EID %u"), Branch.ConsumerEventId);
+				}
+				PrimaryPathText += FString::Printf(TEXT(" ← %s [R%d] ← "), *Branch.ResourceName, Branch.ResourceIndex);
+				PrimaryPathText += Branch.ProducerEventId > 0
+					? FString::Printf(TEXT("EID %u"), Branch.ProducerEventId)
+					: TEXT("边界");
+			}
+			const FCausalLaneBranchEvidence* FirstTransform = DeterministicPrimaryPath.Branches.FindByPredicate(
+				[](const FCausalLaneBranchEvidence& Branch)
+				{
+					return Branch.EdgeRole == TEXT("value-changing-producer") && Branch.ProducerEventId > 0;
+				});
+			if (LastCandidate.IsSet())
+			{
+				const FEventEvidence& FinalWriter = LastCandidate->Event;
+				InfluenceEventId = FinalWriter.EventId;
+				InfluenceType = FinalWriter.ActionKind;
+				InfluenceName = CompactMarkerPath(FinalWriter.MarkerPath);
+				if (InfluenceName.IsEmpty()) InfluenceName = FinalWriter.Action;
+				const bool bNoFinalChange = ClassifyColorDelta(FinalWriter) == TEXT("no-change");
+				InfluenceEffect = bNoFinalChange
+					? TEXT("最终物理写入/传递，但该事件没有改变 P1 数值")
+					: TEXT("最终物理写入并改变了 P1 数值");
+				InfluenceEvidence = FString::Printf(TEXT("Pixel History before=%s；after=%s；change=%s"),
+					FinalWriter.Before.IsEmpty() ? TEXT("unknown") : *FinalWriter.Before,
+					FinalWriter.After.IsEmpty() ? TEXT("unknown") : *FinalWriter.After,
+					*ClassifyColorDelta(FinalWriter));
+				if (PixelColor.IsEmpty() || PixelColor == TEXT("unknown")) PixelColor = FinalWriter.After;
+				Answer = FString::Printf(TEXT("最终物理写入是 EID %u，但它%s。颜色主路径已由执行采样值连接为 %s；当前真实断点是 %s。"),
+					FinalWriter.EventId, bNoFinalChange ? TEXT("只做无变化传递") : TEXT("改变了目标值"),
+					PrimaryPathText.IsEmpty() ? TEXT("未建立") : *PrimaryPathText,
+					DeterministicPrimaryPath.StopReason.IsEmpty() ? TEXT("unknown") : *DeterministicPrimaryPath.StopReason);
+				Finding = FirstTransform
+					? FString::Printf(TEXT("最终颜色经 EID %u 物理写入，首个已确认的数值变化 producer 为 EID %u；主路径在 %s 收束。"),
+						FinalWriter.EventId, FirstTransform->ProducerEventId, *DeterministicPrimaryPath.StopReason)
+					: FString::Printf(TEXT("最终颜色物理写入为 EID %u；未建立已确认的数值变化主路径。"), FinalWriter.EventId);
+			}
+			PointsText = FString::Printf(TEXT("%s · %s\n最终颜色：%s\n确定性主路径：%s\n"),
+				*TargetSample, *TargetCoordinate, *PixelColor,
+				PrimaryPathText.IsEmpty() ? TEXT("未建立") : *PrimaryPathText);
+			Confidence = DeterministicPrimaryPath.Branches.IsEmpty() ? TEXT("low")
+				: (DeterministicPrimaryPath.bReachedExplicitBoundary ? TEXT("medium") : TEXT("high"));
+
+			const FCausalLaneBranchEvidence* GeometryOwner = nullptr;
+			for (const FCausalLaneEvidence& Lane : DeterministicEvidenceLanes)
+			{
+				if (Lane.TracePurpose != TEXT("geometry")) continue;
+				for (const FCausalLaneBranchEvidence& Branch : Lane.Branches)
+				{
+					if (Branch.EdgeRole == TEXT("geometry-owner") && Branch.ProducerEventId > 0
+						&& (!GeometryOwner || Branch.ReverseDepth < GeometryOwner->ReverseDepth))
+					{
+						GeometryOwner = &Branch;
+					}
+				}
+			}
+			if (GeometryOwner)
+			{
+				if (const FEventContextEvidence* GeometryContext = EventContexts.Find(GeometryOwner->ProducerEventId))
+				{
+					MeshName = CompactMarkerPath(GeometryContext->MarkerPath);
+					if (MeshName.IsEmpty()) MeshName = GeometryContext->Action;
+					MeshEvidence = FString::Printf(TEXT("geometry lane：EID %u ← %s [R%d] ← EID %u；mapping=%s；独立于最终 RGB"),
+						GeometryOwner->ConsumerEventId, *GeometryOwner->ResourceName, GeometryOwner->ResourceIndex,
+						GeometryOwner->ProducerEventId, *GeometryOwner->MappingConfidence);
+				}
+			}
+
+			UnknownText.Empty();
+			if (DeterministicPrimaryPath.bReachedExplicitBoundary && !DeterministicPrimaryPath.Branches.IsEmpty())
+			{
+				const FCausalLaneBranchEvidence& Boundary = DeterministicPrimaryPath.Branches.Last();
+				UnknownText += FString::Printf(TEXT("• 主路径断点：EID %u ← %s [R%d]；role=%s；status=%s\n"),
+					Boundary.ConsumerEventId, *Boundary.ResourceName, Boundary.ResourceIndex,
+					*Boundary.EdgeRole, *Boundary.BranchStatus);
+			}
+			if (!BudgetDeferredEventContextDepths.IsEmpty())
+			{
+				UnknownText += FString::Printf(TEXT("• %d 个非主路径 producer 上下文达到安全预算；底层 full trace 保留具体 EID。\n"),
+					BudgetDeferredEventContextDepths.Num());
 			}
 
 			const FString InfluenceHeading = InfluenceEventId > 0
@@ -3402,10 +3650,15 @@ namespace UE::RenderTrail::Private
 			}
 			Output += TEXT("\nShader\n");
 			Output += ShaderText;
-			if (!AgentLaneText.IsEmpty())
+			if (!DeterministicLaneText.IsEmpty())
 			{
-				Output += TEXT("\n并行因果线索（不得合并为单一时间线）\n");
-				Output += AgentLaneText;
+				Output += TEXT("\n确定性主路径与并行因果线索（拓扑由 Replay 证据生成）\n");
+				Output += DeterministicLaneText;
+			}
+			if (!AgentLaneSummaryText.IsEmpty())
+			{
+				Output += TEXT("\nAgent 语义摘要（不参与拓扑）\n");
+				Output += AgentLaneSummaryText;
 			}
 			if (!ProcessText.IsEmpty())
 			{
@@ -3464,7 +3717,7 @@ namespace UE::RenderTrail::Private
 			ViewModel.PixelLabel = FString::Printf(TEXT("%s · %s"), *TargetSample, *TargetCoordinate);
 			ViewModel.FinalColor = PixelColor;
 			ViewModel.Confidence = Confidence;
-			ViewModel.Lanes = BuildDeterministicResultLanes();
+			ViewModel.Lanes = DeterministicResultLanes;
 			ViewModel.ProcessText = ProcessText;
 			ViewModel.PipelineText = PipelineText;
 			ViewModel.ShaderText = ShaderEvidenceText;
@@ -3477,7 +3730,8 @@ namespace UE::RenderTrail::Private
 			ViewModel.Facts.Add(MoveTemp(PassFact));
 			FRenderTrailResultFact LaneFact;
 			LaneFact.Label = TEXT("并行追踪线索");
-			LaneFact.Value = FString::Printf(TEXT("%d 条 · 颜色 / 几何 / 覆盖层分开"), ViewModel.Lanes.Num());
+			LaneFact.Value = FString::Printf(TEXT("1 条最终颜色主路径 + %d 条并行证据线"),
+				FMath::Max(0, ViewModel.Lanes.Num() - 1));
 			ViewModel.Facts.Add(MoveTemp(LaneFact));
 			FRenderTrailResultFact MeshFact;
 			MeshFact.Label = TEXT("几何 / Mesh 归属");
@@ -5563,15 +5817,55 @@ namespace UE::RenderTrail::Private
 				}
 				Evidence->SetBoolField(TEXT("shaderAccessObserved"), true);
 				Evidence->SetStringField(TEXT("shaderAccessDisassembly"), Disassembly);
+				if (Variables && !Variables->IsEmpty())
+				{
+					FString ResultVariableName;
+					FRegexMatcher ResultMatcher(FRegexPattern(
+						TEXT("\\s([_A-Za-z][_A-Za-z0-9\\.]*)\\s*=\\s*__")), Disassembly);
+					if (ResultMatcher.FindNext())
+					{
+						ResultVariableName = ResultMatcher.GetCaptureGroup(1);
+					}
+					for (const TSharedPtr<FJsonValue>& VariableValue : *Variables)
+					{
+						const TSharedPtr<FJsonObject> Variable = VariableValue.IsValid() ? VariableValue->AsObject() : nullptr;
+						const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+						FString VariableName;
+						FString VariableType;
+						if (!Variable.IsValid() || !Variable->TryGetStringField(TEXT("name"), VariableName)
+							|| (!ResultVariableName.IsEmpty() && VariableName != ResultVariableName)
+							|| !Variable->TryGetArrayField(TEXT("values"), Values) || !Values || Values->IsEmpty())
+						{
+							continue;
+						}
+						Variable->TryGetStringField(TEXT("type"), VariableType);
+						TArray<TSharedPtr<FJsonValue>> Components;
+						for (int32 ComponentIndex = 0; ComponentIndex < 4; ++ComponentIndex)
+						{
+							const double Component = Values->IsValidIndex(ComponentIndex)
+								&& (*Values)[ComponentIndex].IsValid()
+								&& (*Values)[ComponentIndex]->Type == EJson::Number
+								? (*Values)[ComponentIndex]->AsNumber() : 0.0;
+							Components.Add(MakeShared<FJsonValueNumber>(Component));
+						}
+						const TSharedRef<FJsonObject> AccessResult = MakeShared<FJsonObject>();
+						AccessResult->SetStringField(TEXT("name"), VariableName);
+						AccessResult->SetStringField(TEXT("type"), VariableType);
+						AccessResult->SetArrayField(TEXT("float"), MoveTemp(Components));
+						Evidence->SetObjectField(TEXT("shaderAccessResult"), AccessResult);
+						break;
+					}
+				}
 				double Instruction = 0.0;
 				if (Access->TryGetNumberField(TEXT("instruction"), Instruction))
 				{
 					Evidence->SetNumberField(TEXT("shaderAccessInstruction"), Instruction);
 				}
-				const bool bExecutedSampleFootprint = CoordinateMapping == TEXT("executed-shader-sample-footprint-candidate");
-				Evidence->SetBoolField(TEXT("shaderCoordinateValuesMatched"), bSawX && bSawY);
+				const bool bExecutedSampleFootprint = CoordinateMapping.StartsWith(TEXT("executed-shader-sample"));
+				const bool bCoordinateEvidenceMatched = bExecutedSampleFootprint || (bSawX && bSawY);
+				Evidence->SetBoolField(TEXT("shaderCoordinateValuesMatched"), bCoordinateEvidenceMatched);
 				Evidence->SetBoolField(TEXT("shaderFootprintDerivedFromExecutedValues"), bExecutedSampleFootprint);
-				if (bSawX && bSawY)
+				if (!bExecutedSampleFootprint && bSawX && bSawY)
 				{
 					Evidence->SetStringField(TEXT("coordinateMapping"), TEXT("executed-shader-load-coordinate"));
 					Evidence->SetStringField(TEXT("mappingConfidence"), TEXT("confirmed-executed-values"));

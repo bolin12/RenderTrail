@@ -434,6 +434,52 @@ namespace UE::RenderTrail::Private
 			if (Confidence == TEXT("candidate")) return 10;
 			return 0;
 		};
+		auto AppendDistinctValue = [](FString& Existing, const FString& Value)
+		{
+			if (Value.IsEmpty() || Existing == Value || Existing.Contains(Value, ESearchCase::CaseSensitive))
+			{
+				return;
+			}
+			if (Existing.IsEmpty())
+			{
+				Existing = Value;
+			}
+			else if (!Existing.Contains(TEXT(" | "), ESearchCase::CaseSensitive))
+			{
+				Existing += TEXT(" | ") + Value;
+			}
+		};
+		auto ParseAccessValue = [](const TSharedPtr<FJsonObject>& Value)
+		{
+			FPixelValueEvidence Result;
+			if (!Value.IsValid())
+			{
+				return Result;
+			}
+			const TArray<TSharedPtr<FJsonValue>>* Components = nullptr;
+			if (!Value->TryGetArrayField(TEXT("float"), Components) || !Components || Components->IsEmpty())
+			{
+				return Result;
+			}
+			double* Channels[] = { &Result.R, &Result.G, &Result.B, &Result.A };
+			TArray<FString> Text;
+			Result.bValid = true;
+			for (int32 Index = 0; Index < 4; ++Index)
+			{
+				const double Component = Components->IsValidIndex(Index) && (*Components)[Index].IsValid()
+					&& (*Components)[Index]->Type == EJson::Number ? (*Components)[Index]->AsNumber() : 0.0;
+				*Channels[Index] = Component;
+				Text.Add(FString::Printf(TEXT("%.6g"), Component));
+			}
+			Result.Text = FString::Printf(TEXT("RGBA (%s)"), *FString::Join(Text, TEXT(", ")));
+			return Result;
+		};
+		auto IsNeutralColor = [](const FPixelValueEvidence& Value)
+		{
+			return Value.bValid && FMath::Abs(Value.R) <= KINDA_SMALL_NUMBER
+				&& FMath::Abs(Value.G) <= KINDA_SMALL_NUMBER
+				&& FMath::Abs(Value.B) <= KINDA_SMALL_NUMBER;
+		};
 
 		TMap<FString, FCausalLaneEvidence> LanesByPurpose;
 		TMap<FString, TMap<FString, int32>> BranchIndicesByPurpose;
@@ -450,16 +496,20 @@ namespace UE::RenderTrail::Private
 
 				FString Purpose = TEXT("color");
 				FString ResourceName = TEXT("unknown-resource");
+				FString ShaderBinding;
 				FString BranchStatus;
 				FString MappingConfidence;
+				double ResourceIndex = INDEX_NONE;
 				double ProducerEventId = 0.0;
 				double ResetBoundaryEventId = 0.0;
 				double Sample = 0.0;
 				double CollapsedAccessCount = 0.0;
 				History->TryGetStringField(TEXT("tracePurpose"), Purpose);
 				History->TryGetStringField(TEXT("resourceName"), ResourceName);
+				History->TryGetStringField(TEXT("shaderBinding"), ShaderBinding);
 				History->TryGetStringField(TEXT("branchStatus"), BranchStatus);
 				History->TryGetStringField(TEXT("mappingConfidence"), MappingConfidence);
+				History->TryGetNumberField(TEXT("resourceIndex"), ResourceIndex);
 				History->TryGetNumberField(TEXT("selectedWriterEventId"), ProducerEventId);
 				History->TryGetNumberField(TEXT("resetBoundaryEventId"), ResetBoundaryEventId);
 				History->TryGetNumberField(TEXT("sample"), Sample);
@@ -479,8 +529,65 @@ namespace UE::RenderTrail::Private
 				Lane.QueryRecordCount += bBoundaryOnlyRecord ? 0 : 1;
 				const uint32 ProducerId = static_cast<uint32>(FMath::Max(0.0, ProducerEventId));
 				const uint32 ResetId = static_cast<uint32>(FMath::Max(0.0, ResetBoundaryEventId));
-				const FString BranchKey = FString::Printf(TEXT("%u|%s|%u|%u"),
-					Context.EventId, *ResourceName, ProducerId, ResetId);
+				const int32 StableResourceIndex = static_cast<int32>(ResourceIndex);
+				FString ResourceAccess;
+				for (const FBoundResourceEvidence& Input : Context.Inputs)
+				{
+					if ((StableResourceIndex != INDEX_NONE && Input.ResourceIndex == StableResourceIndex)
+						|| (!ShaderBinding.IsEmpty() && Input.ShaderBinding == ShaderBinding))
+					{
+						ResourceAccess = Input.Access;
+						break;
+					}
+				}
+
+				bool bExecutedShaderAccess = false;
+				History->TryGetBoolField(TEXT("executedShaderAccess"), bExecutedShaderAccess);
+				const TSharedPtr<FJsonObject>* AccessValueJson = nullptr;
+				const FPixelValueEvidence AccessValue = History->TryGetObjectField(TEXT("shaderAccessResult"), AccessValueJson)
+					&& AccessValueJson ? ParseAccessValue(*AccessValueJson) : FPixelValueEvidence();
+
+				FPixelValueEvidence ProducerBefore;
+				FPixelValueEvidence ProducerShaderOutput;
+				FPixelValueEvidence ProducerWritten;
+				FString ProducerActionKind;
+				bool bProducerChangedValue = false;
+				const TArray<TSharedPtr<FJsonValue>>* EventSummaries = nullptr;
+				if (ProducerId > 0 && History->TryGetArrayField(TEXT("eventSummaries"), EventSummaries) && EventSummaries)
+				{
+					for (const TSharedPtr<FJsonValue>& EventValue : *EventSummaries)
+					{
+						const TSharedPtr<FJsonObject> Event = EventValue.IsValid() ? EventValue->AsObject() : nullptr;
+						double EventId = 0.0;
+						if (!Event.IsValid() || !Event->TryGetNumberField(TEXT("eventId"), EventId)
+							|| static_cast<uint32>(EventId) != ProducerId)
+						{
+							continue;
+						}
+						Event->TryGetStringField(TEXT("actionKind"), ProducerActionKind);
+						Event->TryGetBoolField(TEXT("changedTextureValue"), bProducerChangedValue);
+						const TSharedPtr<FJsonObject>* PixelValue = nullptr;
+						if (Event->TryGetObjectField(TEXT("firstBefore"), PixelValue) && PixelValue)
+						{
+							ProducerBefore = ParsePixelValue(*PixelValue);
+						}
+						if (Event->TryGetObjectField(TEXT("lastShaderOutput"), PixelValue) && PixelValue)
+						{
+							ProducerShaderOutput = ParsePixelValue(*PixelValue);
+						}
+						if (Event->TryGetObjectField(TEXT("lastAfter"), PixelValue) && PixelValue)
+						{
+							// postMod/lastAfter is the authoritative written resource value for draw,
+							// copy and compute/UAV paths. Compute shaderOut is not an RT output value.
+							ProducerWritten = ParsePixelValue(*PixelValue);
+						}
+						break;
+					}
+				}
+				const bool bValueMatch = AccessValue.bValid && ProducerWritten.bValid
+					&& ComputeColorDeltaMax(AccessValue, ProducerWritten) <= SignificantColorDeltaThreshold;
+				const FString BranchKey = FString::Printf(TEXT("%u|%d|%s|%s|%u|%u"),
+					Context.EventId, StableResourceIndex, *ResourceName, *ShaderBinding, ProducerId, ResetId);
 				TMap<FString, int32>& BranchIndices = BranchIndicesByPurpose.FindOrAdd(Purpose);
 				int32* ExistingIndex = BranchIndices.Find(BranchKey);
 				if (!ExistingIndex)
@@ -490,14 +597,27 @@ namespace UE::RenderTrail::Private
 					Branch.ConsumerEventId = Context.EventId;
 					Branch.ProducerEventId = ProducerId;
 					Branch.ResetBoundaryEventId = ResetId;
+					Branch.ResourceIndex = StableResourceIndex;
 					Branch.ReverseDepth = EventContextDepths.FindRef(Context.EventId);
 					Branch.ResourceName = ResourceName;
+					Branch.ShaderBinding = ShaderBinding;
+					Branch.ResourceAccess = ResourceAccess;
 					Branch.BranchStatus = BranchStatus;
 					Branch.MappingConfidence = MappingConfidence;
+					Branch.ExecutedSampleValue = AccessValue.Text;
+					Branch.ProducerBeforeValue = ProducerBefore.Text;
+					Branch.ProducerShaderOutputValue = ProducerShaderOutput.Text;
+					Branch.ProducerWrittenValue = ProducerWritten.Text;
+					Branch.ProducerActionKind = ProducerActionKind;
 					Branch.Samples.Add(static_cast<int32>(Sample));
 					Branch.EvidenceRecordCount = 1;
 					Branch.QueryRecordCount = bBoundaryOnlyRecord ? 0 : 1;
 					Branch.CollapsedShaderAccessCount = static_cast<int32>(CollapsedAccessCount);
+					Branch.bExecutedShaderAccess = bExecutedShaderAccess;
+					Branch.bHasExecutedSampleValue = AccessValue.bValid;
+					Branch.bExecutedSampleValueNeutral = IsNeutralColor(AccessValue);
+					Branch.bProducerChangedValue = bProducerChangedValue;
+					Branch.bProducerValueMatchesExecutedSample = bValueMatch;
 					const int32 NewIndex = Lane.Branches.Add(MoveTemp(Branch));
 					BranchIndices.Add(BranchKey, NewIndex);
 					continue;
@@ -509,6 +629,22 @@ namespace UE::RenderTrail::Private
 				Branch.QueryRecordCount += bBoundaryOnlyRecord ? 0 : 1;
 				Branch.CollapsedShaderAccessCount = FMath::Max(Branch.CollapsedShaderAccessCount,
 					static_cast<int32>(CollapsedAccessCount));
+				AppendDistinctValue(Branch.ExecutedSampleValue, AccessValue.Text);
+				AppendDistinctValue(Branch.ProducerBeforeValue, ProducerBefore.Text);
+				AppendDistinctValue(Branch.ProducerShaderOutputValue, ProducerShaderOutput.Text);
+				AppendDistinctValue(Branch.ProducerWrittenValue, ProducerWritten.Text);
+				Branch.bExecutedShaderAccess |= bExecutedShaderAccess;
+				if (AccessValue.bValid)
+				{
+					Branch.bExecutedSampleValueNeutral = Branch.bHasExecutedSampleValue
+						? (Branch.bExecutedSampleValueNeutral && IsNeutralColor(AccessValue))
+						: IsNeutralColor(AccessValue);
+					Branch.bHasExecutedSampleValue = true;
+				}
+				Branch.bProducerChangedValue |= bProducerChangedValue;
+				Branch.bProducerValueMatchesExecutedSample |= bValueMatch;
+				if (Branch.ProducerActionKind.IsEmpty()) Branch.ProducerActionKind = ProducerActionKind;
+				if (Branch.ResourceAccess.IsEmpty()) Branch.ResourceAccess = ResourceAccess;
 				if (StatusRank(BranchStatus) > StatusRank(Branch.BranchStatus))
 				{
 					Branch.BranchStatus = BranchStatus;
@@ -532,6 +668,69 @@ namespace UE::RenderTrail::Private
 			for (FCausalLaneBranchEvidence& Branch : Lane->Branches)
 			{
 				Branch.Samples.Sort();
+				const bool bConsumerOutputFeedback = Branch.ResourceAccess.Contains(TEXT("write"), ESearchCase::IgnoreCase);
+				const bool bConfirmedMapping = Branch.MappingConfidence.StartsWith(TEXT("confirmed-executed-"));
+				if (bConsumerOutputFeedback)
+				{
+					Branch.EdgeRole = TEXT("consumer-read-write-output");
+				}
+				else if (Branch.ResetBoundaryEventId > 0)
+				{
+					Branch.EdgeRole = TEXT("reset-boundary");
+				}
+				else if (Branch.TracePurpose == TEXT("geometry") && Branch.ProducerEventId > 0)
+				{
+					Branch.EdgeRole = TEXT("geometry-owner");
+				}
+				else if (Branch.bHasExecutedSampleValue && Branch.bExecutedSampleValueNeutral)
+				{
+					Branch.EdgeRole = TEXT("neutral-input");
+				}
+				else if (Branch.ProducerEventId > 0 && Branch.bProducerChangedValue)
+				{
+					Branch.EdgeRole = TEXT("value-changing-producer");
+				}
+				else if (Branch.ProducerEventId > 0)
+				{
+					Branch.EdgeRole = TEXT("pass-through-producer");
+				}
+				else if (Branch.ResourceName.Contains(TEXT("History"), ESearchCase::IgnoreCase))
+				{
+					Branch.EdgeRole = TEXT("external-history-boundary");
+				}
+				else if (Branch.BranchStatus.Contains(TEXT("pruned"), ESearchCase::IgnoreCase)
+					|| Branch.BranchStatus.Contains(TEXT("budget"), ESearchCase::IgnoreCase))
+				{
+					Branch.EdgeRole = TEXT("budget-boundary");
+				}
+				else
+				{
+					Branch.EdgeRole = TEXT("unresolved-boundary");
+				}
+
+				if (Branch.ResetBoundaryEventId > 0 || (Branch.TracePurpose == TEXT("geometry")
+					&& Branch.ProducerEventId > 0 && bConfirmedMapping))
+				{
+					Branch.EdgeConfidence = TEXT("confirmed");
+				}
+				else if (Branch.ProducerEventId > 0 && bConfirmedMapping && Branch.bExecutedShaderAccess
+					&& Branch.bHasExecutedSampleValue && (Branch.bProducerValueMatchesExecutedSample
+						|| Branch.EdgeRole == TEXT("neutral-input")))
+				{
+					Branch.EdgeConfidence = TEXT("confirmed-value-flow");
+				}
+				else if (Branch.ProducerEventId > 0 && bConfirmedMapping && Branch.bExecutedShaderAccess)
+				{
+					Branch.EdgeConfidence = TEXT("strong-executed-read");
+				}
+				else if (Branch.ProducerEventId > 0)
+				{
+					Branch.EdgeConfidence = TEXT("partial-structural");
+				}
+				else
+				{
+					Branch.EdgeConfidence = TEXT("blocked");
+				}
 				if (Branch.ProducerEventId > 0) ++Lane->ConfirmedProducerCount;
 				else if (Branch.ResetBoundaryEventId > 0) ++Lane->ResetBoundaryCount;
 				else ++Lane->UnresolvedBoundaryCount;
@@ -546,6 +745,102 @@ namespace UE::RenderTrail::Private
 				return A.ResourceName < B.ResourceName;
 			});
 			Result.Add(MoveTemp(*Lane));
+		}
+		return Result;
+	}
+
+	FPrimaryCausalPathEvidence BuildPrimaryColorPathEvidence(
+		const TArray<FCausalLaneEvidence>& Lanes,
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		uint32 RootEventId,
+		int32 MaxHops)
+	{
+		FPrimaryCausalPathEvidence Result;
+		Result.RootEventId = RootEventId;
+		if (RootEventId == 0)
+		{
+			Result.StopReason = TEXT("missing-final-writer");
+			return Result;
+		}
+
+		TArray<const FCausalLaneBranchEvidence*> AllBranches;
+		for (const FCausalLaneEvidence& Lane : Lanes)
+		{
+			for (const FCausalLaneBranchEvidence& Branch : Lane.Branches)
+			{
+				AllBranches.Add(&Branch);
+			}
+		}
+		TSet<uint32> VisitedEvents;
+		uint32 ConsumerEventId = RootEventId;
+		for (int32 Hop = 0; Hop < FMath::Max(1, MaxHops); ++Hop)
+		{
+			if (VisitedEvents.Contains(ConsumerEventId))
+			{
+				Result.StopReason = TEXT("cycle-rejected");
+				Result.bReachedExplicitBoundary = true;
+				break;
+			}
+			VisitedEvents.Add(ConsumerEventId);
+
+			const FCausalLaneBranchEvidence* Best = nullptr;
+			int32 BestScore = MIN_int32;
+			for (const FCausalLaneBranchEvidence* Branch : AllBranches)
+			{
+				if (!Branch || Branch->ConsumerEventId != ConsumerEventId || Branch->TracePurpose == TEXT("geometry")
+					|| Branch->ProducerEventId == Branch->ConsumerEventId)
+				{
+					continue;
+				}
+				int32 Score = 0;
+				Score += Branch->ProducerEventId > 0 ? 100 : 0;
+				Score += Branch->EdgeConfidence.StartsWith(TEXT("confirmed")) ? 90
+					: (Branch->EdgeConfidence.StartsWith(TEXT("strong")) ? 65 : 0);
+				Score += Branch->EdgeRole == TEXT("value-changing-producer") ? 90 : 0;
+				Score += Branch->EdgeRole == TEXT("pass-through-producer") ? 80 : 0;
+				Score += Branch->EdgeRole == TEXT("external-history-boundary") ? 70 : 0;
+				Score -= Branch->EdgeRole == TEXT("neutral-input") ? 260 : 0;
+				Score -= Branch->EdgeRole == TEXT("consumer-read-write-output") ? 400 : 0;
+				Score -= Branch->ResourceName.Contains(TEXT("BlackDummy"), ESearchCase::IgnoreCase) ? 300 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("TSR.Output"), ESearchCase::IgnoreCase) ? 130 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("SceneColor"), ESearchCase::IgnoreCase) ? 120 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("Tonemap"), ESearchCase::IgnoreCase) ? 110 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("SelectionOutlineColor"), ESearchCase::IgnoreCase) ? 100 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("History.Color"), ESearchCase::IgnoreCase) ? 95 : 0;
+				Score += Branch->ResourceName.Contains(TEXT("Bloom"), ESearchCase::IgnoreCase) ? 20 : 0;
+				if (!Best || Score > BestScore || (Score == BestScore && Branch->ResourceIndex < Best->ResourceIndex))
+				{
+					Best = Branch;
+					BestScore = Score;
+				}
+			}
+			if (!Best)
+			{
+				if (const FEventContextEvidence* Context = EventContexts.Find(ConsumerEventId);
+					Context && IsSceneSourceEvent(Context->ActionKind, Context->MarkerPath))
+				{
+					Result.bReachedConfirmedSceneSource = true;
+					Result.StopReason = TEXT("scene-source-reached");
+				}
+				else
+				{
+					Result.StopReason = TEXT("no-upstream-color-edge");
+				}
+				break;
+			}
+			Result.Branches.Add(*Best);
+			if (Best->ProducerEventId == 0)
+			{
+				Result.bReachedExplicitBoundary = true;
+				Result.StopReason = Best->EdgeRole;
+				break;
+			}
+			ConsumerEventId = Best->ProducerEventId;
+		}
+		if (Result.StopReason.IsEmpty())
+		{
+			Result.StopReason = TEXT("maximum-hop-boundary");
+			Result.bReachedExplicitBoundary = true;
 		}
 		return Result;
 	}

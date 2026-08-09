@@ -4,6 +4,17 @@
 
 ## 2026-08-10
 
+### 值驱动的最终颜色主路径
+
+- 新增本地确定性的 `primaryColorPath`，从最终 writer 沿实际读取资源、采样值和 producer 写后值选择主路径。
+- 为因果边增加角色和置信度，区分值变化、值传递、中性输入、consumer 自身输出和各种收束边界。
+- 资源身份改用 `resourceIndex`；修复同名输入/输出纹理被串成 producer 自环的问题。
+- Compute/Copy/Draw 的权威写后值统一使用 Pixel History `lastAfter/postMod`，不再误用 compute 的零 `shaderOutput`。
+- Shader Debug 的已执行 UV 有界 footprint 与实际 sample 值进入强证据；提示词不再要求只有精确 texel 才能证明执行读取。
+- Agent 不再生成 lane 拓扑或最终 RT 过程；顶部结论、主路径和过程均由本地证据确定，模型只负责摘要。
+- UI 首先展示最终颜色主路径，其他颜色、几何和覆盖分支独立显示；被摘要隐藏的分支可原地展开查看。
+- focused policy 测试新增 E11083→E10891→E10823→E10203 值流、compute 写后值和同名不同资源回归场景。
+
 ### 因果 lane、提示词与结果页重构
 
 - 新增最终颜色、几何归属和覆盖层三类 `causalLanes`。

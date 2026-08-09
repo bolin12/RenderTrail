@@ -197,14 +197,29 @@ namespace UE::RenderTrail::Private
 		uint32 ConsumerEventId = 0;
 		uint32 ProducerEventId = 0;
 		uint32 ResetBoundaryEventId = 0;
+		int32 ResourceIndex = INDEX_NONE;
 		int32 ReverseDepth = 0;
 		FString ResourceName;
+		FString ShaderBinding;
+		FString ResourceAccess;
 		FString BranchStatus;
 		FString MappingConfidence;
+		FString EdgeRole;
+		FString EdgeConfidence;
+		FString ExecutedSampleValue;
+		FString ProducerBeforeValue;
+		FString ProducerShaderOutputValue;
+		FString ProducerWrittenValue;
+		FString ProducerActionKind;
 		TArray<int32> Samples;
 		int32 EvidenceRecordCount = 0;
 		int32 QueryRecordCount = 0;
 		int32 CollapsedShaderAccessCount = 0;
+		bool bExecutedShaderAccess = false;
+		bool bHasExecutedSampleValue = false;
+		bool bExecutedSampleValueNeutral = false;
+		bool bProducerChangedValue = false;
+		bool bProducerValueMatchesExecutedSample = false;
 	};
 
 	struct FCausalLaneEvidence
@@ -215,6 +230,15 @@ namespace UE::RenderTrail::Private
 		int32 UnresolvedBoundaryCount = 0;
 		int32 EvidenceRecordCount = 0;
 		int32 QueryRecordCount = 0;
+		TArray<FCausalLaneBranchEvidence> Branches;
+	};
+
+	struct FPrimaryCausalPathEvidence
+	{
+		uint32 RootEventId = 0;
+		bool bReachedConfirmedSceneSource = false;
+		bool bReachedExplicitBoundary = false;
+		FString StopReason;
 		TArray<FCausalLaneBranchEvidence> Branches;
 	};
 
@@ -232,6 +256,11 @@ namespace UE::RenderTrail::Private
 	TArray<FCausalLaneEvidence> BuildCausalLaneEvidence(
 		const TMap<uint32, FEventContextEvidence>& EventContexts,
 		const TMap<uint32, int32>& EventContextDepths);
+	FPrimaryCausalPathEvidence BuildPrimaryColorPathEvidence(
+		const TArray<FCausalLaneEvidence>& Lanes,
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		uint32 RootEventId,
+		int32 MaxHops = MaxCausalGraphHops);
 	TArray<FEventEvidence> AggregateEvents(const FPixelSample& Sample);
 	const FEventEvidence* FindEvent(const TArray<FEventEvidence>& Events, uint32 EventId);
 	FString DescribeEventResult(const FEventEvidence& Event);

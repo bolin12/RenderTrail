@@ -6,7 +6,7 @@
 
 ## 当前结论
 
-RenderTrail 已从“只解释最终后处理写入”推进到“围绕同一选中像素，分别呈现最终颜色、几何归属和覆盖层三条因果线”。三条线索会并行发现和归类，但 RenderDoc Replay 请求仍按单 Worker 串行执行，以避免 Replay Controller 并发和显存压力。
+RenderTrail 已从“只解释最终后处理写入”推进到“先计算一条值驱动的最终颜色主路径，再并列呈现几何归属、覆盖层和其他输入分支”。线索会并行发现和归类，但 RenderDoc Replay 请求仍按单 Worker 串行执行，以避免 Replay Controller 并发和显存压力。
 
 当前最重要的行为是：
 
@@ -14,7 +14,26 @@ RenderTrail 已从“只解释最终后处理写入”推进到“围绕同一�
 - “分析当前像素”自动执行有界深追，不再要求用户点击“继续深追”。
 - UI 和 Agent 不再把 Depth/Mesh、TSR/Tonemap/Bloom、Outline 串成一条虚假的时间链。
 - Mesh 归属作为独立的几何证据显示，不再挂在最终 Composite Pass 名下。
+- 最终颜色主路径由本地确定性算法选择，Agent 不再生成或改写跨资源拓扑。
+- 因果节点以 RenderDoc `resourceIndex` 区分；同名输入、输出纹理不会再形成虚假的自环。
+- Compute/Copy/Draw producer 的权威写后值取 Pixel History `lastAfter/postMod`，不再把无代表性的 compute `shaderOutput` 零值当作结果。
 - 全量调试记录保存在本地 trace 目录；Agent 只接收经过压缩、仍可审计的证据投影。
+
+## 最新样本的因果链校正
+
+样本目录：
+
+`Saved/RenderTrailTraces/2026.08.10-00.01.49_capture_P1_1491_684_G2_20260810-000715`
+
+旧结果只强调 E11083 Composite，并把 E10203 Compute 的 `shaderOutput = 0` 当成输出，因此看起来“没有继续往下追”。重新按资源 ID、实际采样值和 producer 写后值评估后，证据支持的颜色主路径为：
+
+`E11083 Composite ← SelectionOutlineColor ← E10891 Composite ← Tonemap ← E10823 Tonemap ← TSR.Output ← E10203 Compute ← TSR.History.Color 边界`
+
+- E11083 与 E10891 是保持选中像素值的传递/合成节点。
+- E10823 把 TSR 输出映射为最终显示颜色，是已确认的值变化节点。
+- E10203 的权威结果来自 `lastAfter/postMod = [0.1328125, 0.9765625, 0.123046875, 1]`，不能使用其零 `shaderOutput`。
+- 当前真正未闭合的位置是 E10203 之前的 `TSR.History.Color` 映射边界，而不是 E11083 之后“没有 Mesh”。
+- 几何归属仍作为旁路证据显示；它回答表面/Depth 所属，不伪装成颜色主路径的一环。
 
 ## 最近一次基线
 
@@ -68,16 +87,18 @@ RenderTrail 已从“只解释最终后处理写入”推进到“围绕同一�
 
 ### 4. 因果线、提示词和 UI
 
-- 新增 `causalLanes` 证据模型，按 `tracePurpose + consumer + resource + producer/reset` 分组。
-- Agent 输出契约新增 `lanes[]`；步骤统一写成 `consumer EID ← resource ← producer EID`。
+- 新增 `causalLanes` 证据模型，按 `tracePurpose + consumer + resourceIndex + producer/reset` 分组。
+- 新增本地确定性的 `primaryColorPath`；它按实际读取、采样值、producer 写后值与边界状态选择主路径。
+- 每条边标记 `value-changing-producer`、`pass-through-producer`、`neutral-input`、`consumer-read-write-output` 或明确边界，并附置信度。
+- Agent 仍可整理 lane 摘要，但不得输出拓扑步骤；最终主路径、顶部结论和最终 RT 直接写入均由本地证据生成。
 - 原 `process[]` 只允许表示最终 RT 的直接写入顺序，最多保留四步，不再承担完整资源图职责。
-- 结果页按线索显示卡片，并分别展示最终物理 writer、几何/Mesh 归属、覆盖、Pipeline 和 Shader 事实。
+- 结果页先显示最终颜色主路径，再显示颜色旁支、几何归属和覆盖层；每条 lane 可展开查看未进入摘要的全量分支。
 - 原始报告新增“几何 / Mesh 归属（独立于最终 Composite）”段落。
 
 ## 验证状态
 
-- 编辑器模块已完成无链接 C++ 编译检查。
-- 已生成并链接 `UnrealEditor-RenderTrailAnalyzerEditor-8092402.dll`。
+- 编辑器模块已完成编译和链接检查。
+- 已生成并链接 `UnrealEditor-RenderTrailAnalyzerEditor-810010.dll`。
 - `UnrealEditor.modules` 已指向上述模块。
 - 自动化测试 `RenderTrail.Analyzer.Trace.FocusedPolicy` 通过，进程退出码为 0。
 
@@ -85,7 +106,7 @@ RenderTrail 已从“只解释最终后处理写入”推进到“围绕同一�
 
 ## 仍需验证或保留的边界
 
-- 需要在重启后的编辑器中，对同一 capture 重新分析一次，确认三条 lane、顶部事实和 Agent 文本均采用新结构。
+- 需要在重启后的编辑器中，对同一 capture 重新分析一次，确认颜色主路径、旁路线索、顶部事实和 Agent 摘要均采用新结构。
 - “producer 结构上参与了颜色形成”不等于“已经证明其精确 shader 数学贡献”；只有 Shader Debug 或明确的数据流证据才能给出更强结论。
 - Compute/TSR 等路径的精确上游像素映射可能只能到候选 footprint，UI 必须保留映射置信度。
 - Agent 详细上下文仍限制为 12 个；完整轻量上下文索引和 `causalLanes` 覆盖全部已收集上下文。
@@ -95,9 +116,9 @@ RenderTrail 已从“只解释最终后处理写入”推进到“围绕同一�
 
 ## 下一次验收重点
 
-1. 重启 Unreal Editor，确认加载 `8092402` 或更新版本模块。
-2. 对 P1 `(1480, 676)` 重跑“分析当前像素”。
-3. 确认 UI 同时出现最终颜色、几何归属、覆盖层三条独立 lane。
-4. 核对 E10688 只作为最终物理 writer，E1427 只出现在几何/Mesh 证据中。
+1. 重启 Unreal Editor，确认加载 `810010` 或更新版本模块。
+2. 对最新样本 P1 `(1491, 684)` 重跑“分析当前像素”。
+3. 确认 UI 首先显示 E11083 到 E10203 的最终颜色主路径，并把 `TSR.History.Color` 标成真实边界。
+4. 核对同名但不同 `resourceIndex` 的输入/输出资源不再显示成自环；几何/Mesh 只出现在独立旁路证据中。
 5. 核对 UI 中“证据记录数”和“实际 Pixel History 查询数”不再混淆。
 6. 打开本地 full trace，确认任何未展开分支都有 producer、reset、terminal、pruned 或 error 之一的明确状态。

@@ -34,6 +34,8 @@ namespace UE::RenderTrail::Private
 		FString Title;
 		FString Summary;
 		TArray<FRenderTrailResultNode> Nodes;
+		FString FullEvidenceTitle;
+		FString FullEvidenceText;
 	};
 
 	struct FRenderTrailAgentResultViewModel

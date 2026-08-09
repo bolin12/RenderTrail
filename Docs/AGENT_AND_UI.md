@@ -9,6 +9,7 @@ Agent 的职责是整理已经收集到的 RenderDoc 证据，而不是替代 Re
 - 全局轻量索引：覆盖所有已收集 Event Context，防止重要事件因详细上下文上限而完全消失；
 - 详细上下文：最多展开 12 个高价值事件的 Pipeline、Shader、资源和 Pixel History 细节；
 - `causalLanes`：覆盖全部上下文的分组因果分支，区分颜色、几何和覆盖层。
+- `primaryColorPath`：由本地代码根据资源 ID、实际读取、采样值和 producer 写后值生成的权威颜色主路径。
 
 详细投影是模型输入预算，不是 Replay 收集上限。被压缩的信息仍应在本地 full trace 中可查。
 
@@ -17,7 +18,7 @@ Agent 的职责是整理已经收集到的 RenderDoc 证据，而不是替代 Re
 结构化结果应包含：
 
 - 最终物理 writer；
-- `lanes[]`：每条 lane 的目标、结论、分支和证据引用；
+- `lanes[]`：每条 lane 的目标、结论和证据引用；拓扑步骤必须留空；
 - Pipeline 与 Shader 事实；
 - 几何/Mesh 归属及其置信度；
 - 未解析分支、裁剪原因和失败；
@@ -28,6 +29,8 @@ Agent 的职责是整理已经收集到的 RenderDoc 证据，而不是替代 Re
 `consumer EID ← resource ← producer EID`
 
 Agent 不得把不同资源、不同 trace purpose 的事件串成一条看似连续的时间链。
+
+UI 中的 lane 拓扑、顶部确定性结论和最终 RT 直接写入过程只来自本地证据构建器。Agent 可以压缩措辞和指出风险，但不能新增边、改写 producer、合并同名不同 ID 的资源，也不能覆盖本地选出的主路径。
 
 ## 提示词位置
 
@@ -45,11 +48,12 @@ Agent 不得把不同资源、不同 trace purpose 的事件串成一条看似�
 
 结果 UI 按下列层次组织：
 
-1. 顶部事实：最终物理 writer、lane 数、几何/Mesh、覆盖、Pipeline、Shader；
-2. 因果 lane 卡片：最终颜色、几何归属、覆盖层分别展示；
-3. 最终 RT 直接写入：只保留短时间序列；
-4. 证据详情：Event、Pipeline、Shader、资源与 Pixel History；
-5. 完整性与诊断：查询数、证据记录数、裁剪、错误和 full trace 路径。
+1. 顶部事实：最终物理 writer、主路径、几何/Mesh、覆盖、Pipeline、Shader；
+2. 最终颜色主路径卡片：按值流显示主要 producer，并明确真实停止边界；
+3. 旁路因果卡片：其他颜色输入、几何归属和覆盖层分别展示，可展开全量分支；
+4. 最终 RT 直接写入：只保留短时间序列；
+5. 证据详情：Event、Pipeline、Shader、资源与 Pixel History；
+6. 完整性与诊断：查询数、证据记录数、裁剪、错误和 full trace 路径。
 
 Mesh 信息不能显示在 Composite 卡片内部，除非证据确实证明该 Composite draw 本身就是该 Mesh draw。
 

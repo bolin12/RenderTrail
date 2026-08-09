@@ -145,6 +145,149 @@ namespace UE::RenderTrail::Private
 					LutBoundary->BranchStatus, FString(TEXT("no-modification-before-consumer")));
 			}
 		}
+
+		auto MakePixelValue = [](double R, double G, double B, double A)
+		{
+			const TSharedRef<FJsonObject> Value = MakeShared<FJsonObject>();
+			Value->SetBoolField(TEXT("valid"), true);
+			TArray<TSharedPtr<FJsonValue>> Components;
+			Components.Add(MakeShared<FJsonValueNumber>(R));
+			Components.Add(MakeShared<FJsonValueNumber>(G));
+			Components.Add(MakeShared<FJsonValueNumber>(B));
+			Components.Add(MakeShared<FJsonValueNumber>(A));
+			Value->SetArrayField(TEXT("float"), MoveTemp(Components));
+			Value->SetNumberField(TEXT("depth"), -1.0);
+			Value->SetNumberField(TEXT("stencil"), -1.0);
+			return Value;
+		};
+		auto MakeValueFlowHistory = [&MakePixelValue](const FString& Resource, int32 ResourceIndex,
+			const FString& Binding, uint32 Writer, bool bWriterChanged,
+			double R, double G, double B, double A, const FString& Status = TEXT("continued-to-dominating-writer"))
+		{
+			const TSharedRef<FJsonObject> History = MakeShared<FJsonObject>();
+			History->SetStringField(TEXT("tracePurpose"), TEXT("color"));
+			History->SetStringField(TEXT("resourceName"), Resource);
+			History->SetNumberField(TEXT("resourceIndex"), ResourceIndex);
+			History->SetStringField(TEXT("shaderBinding"), Binding);
+			History->SetNumberField(TEXT("selectedWriterEventId"), Writer);
+			History->SetNumberField(TEXT("sample"), 0);
+			History->SetStringField(TEXT("branchStatus"), Status);
+			History->SetStringField(TEXT("mappingConfidence"), TEXT("confirmed-executed-values"));
+			History->SetBoolField(TEXT("executedShaderAccess"), true);
+			History->SetObjectField(TEXT("shaderAccessResult"), MakePixelValue(R, G, B, A));
+			if (Writer > 0)
+			{
+				const TSharedRef<FJsonObject> Event = MakeShared<FJsonObject>();
+				Event->SetNumberField(TEXT("eventId"), Writer);
+				Event->SetStringField(TEXT("actionKind"), Writer == 10203 ? TEXT("dispatch") : TEXT("draw"));
+				Event->SetBoolField(TEXT("changedTextureValue"), bWriterChanged);
+				Event->SetNumberField(TEXT("passedFragments"), 1);
+				Event->SetObjectField(TEXT("firstBefore"), MakePixelValue(0, 0, 0, 0));
+				// Compute shaderOut may be zero even though the UAV/resource postMod is non-zero.
+				Event->SetObjectField(TEXT("lastShaderOutput"), MakePixelValue(0, 0, 0, 0));
+				Event->SetObjectField(TEXT("lastAfter"), MakePixelValue(R, G, B, A));
+				TArray<TSharedPtr<FJsonValue>> Summaries;
+				Summaries.Add(MakeShared<FJsonValueObject>(Event));
+				History->SetArrayField(TEXT("eventSummaries"), MoveTemp(Summaries));
+			}
+			return MakeShared<FJsonValueObject>(History);
+		};
+		auto AddInput = [](FEventContextEvidence& Context, int32 ResourceIndex,
+			const FString& Name, const FString& Binding, const FString& Access)
+		{
+			FBoundResourceEvidence Input;
+			Input.ResourceIndex = ResourceIndex;
+			Input.Name = Name;
+			Input.ShaderBinding = Binding;
+			Input.Access = Access;
+			Input.bTexture = true;
+			Context.Inputs.Add(MoveTemp(Input));
+		};
+
+		TMap<uint32, FEventContextEvidence> PathContexts;
+		TMap<uint32, int32> PathDepths;
+		FEventContextEvidence Composite;
+		Composite.EventId = 11083;
+		AddInput(Composite, 2049, TEXT("SelectionOutlineColor"), TEXT("ColorTexture"), TEXT("read"));
+		Composite.ResourcePixelHistories.Add(MakeValueFlowHistory(TEXT("SelectionOutlineColor"), 2049,
+			TEXT("ColorTexture"), 10891, false, 0.436, 0.882, 0.419, 0));
+		PathContexts.Add(Composite.EventId, Composite);
+		PathDepths.Add(Composite.EventId, 0);
+
+		FEventContextEvidence Outline;
+		Outline.EventId = 10891;
+		AddInput(Outline, 2032, TEXT("Tonemap"), TEXT("ColorTexture"), TEXT("read"));
+		Outline.ResourcePixelHistories.Add(MakeValueFlowHistory(TEXT("Tonemap"), 2032,
+			TEXT("ColorTexture"), 10823, true, 0.436, 0.882, 0.419, 0));
+		PathContexts.Add(Outline.EventId, Outline);
+		PathDepths.Add(Outline.EventId, 1);
+
+		FEventContextEvidence Tonemap;
+		Tonemap.EventId = 10823;
+		AddInput(Tonemap, 2297, TEXT("TSR.Output"), TEXT("ColorTexture"), TEXT("read"));
+		Tonemap.ResourcePixelHistories.Add(MakeValueFlowHistory(TEXT("TSR.Output"), 2297,
+			TEXT("ColorTexture"), 10203, true, 0.133, 0.977, 0.123, 1));
+		PathContexts.Add(Tonemap.EventId, Tonemap);
+		PathDepths.Add(Tonemap.EventId, 2);
+
+		FEventContextEvidence ResolveHistory;
+		ResolveHistory.EventId = 10203;
+		AddInput(ResolveHistory, 1530, TEXT("TSR.History.Color"), TEXT("UpdateHistoryOutputTexture"), TEXT("read"));
+		AddInput(ResolveHistory, 2297, TEXT("TSR.Output"), TEXT("SceneColorOutputMip0"), TEXT("read-write"));
+		TSharedPtr<FJsonValue> HistoryBoundaryValue = MakeValueFlowHistory(TEXT("TSR.History.Color"), 1530,
+			TEXT("UpdateHistoryOutputTexture"), 0, false, 0, 0, 0, 0, TEXT("focused-fallback-pruned"));
+		HistoryBoundaryValue->AsObject()->RemoveField(TEXT("shaderAccessResult"));
+		HistoryBoundaryValue->AsObject()->SetBoolField(TEXT("executedShaderAccess"), false);
+		ResolveHistory.ResourcePixelHistories.Add(HistoryBoundaryValue);
+		TSharedPtr<FJsonValue> OutputFeedbackValue = MakeValueFlowHistory(TEXT("TSR.Output"), 2297,
+			TEXT("SceneColorOutputMip0"), 0, false, 0, 0, 0, 0, TEXT("no-modification-before-consumer"));
+		OutputFeedbackValue->AsObject()->RemoveField(TEXT("shaderAccessResult"));
+		OutputFeedbackValue->AsObject()->SetBoolField(TEXT("executedShaderAccess"), false);
+		ResolveHistory.ResourcePixelHistories.Add(OutputFeedbackValue);
+		PathContexts.Add(ResolveHistory.EventId, ResolveHistory);
+		PathDepths.Add(ResolveHistory.EventId, 3);
+
+		const TArray<FCausalLaneEvidence> PathLanes = BuildCausalLaneEvidence(PathContexts, PathDepths);
+		const FPrimaryCausalPathEvidence PrimaryPath = BuildPrimaryColorPathEvidence(
+			PathLanes, PathContexts, 11083);
+		TestEqual(TEXT("Primary path reaches the temporal-history boundary"), PrimaryPath.Branches.Num(), 4);
+		if (PrimaryPath.Branches.Num() == 4)
+		{
+			TestEqual(TEXT("Primary path follows the outline pass-through"), PrimaryPath.Branches[0].ProducerEventId, 10891u);
+			TestEqual(TEXT("Primary path follows Tonemap"), PrimaryPath.Branches[1].ProducerEventId, 10823u);
+			TestEqual(TEXT("Primary path follows TSR ResolveHistory"), PrimaryPath.Branches[2].ProducerEventId, 10203u);
+			TestEqual(TEXT("Read-write TSR output is not mistaken for a compute input"),
+				PrimaryPath.Branches[3].ResourceIndex, 1530);
+			TestEqual(TEXT("Temporal input is an explicit external-history boundary"),
+				PrimaryPath.Branches[3].EdgeRole, FString(TEXT("external-history-boundary")));
+			TestTrue(TEXT("Compute producer uses postMod/lastAfter for value matching"),
+				PrimaryPath.Branches[2].bProducerValueMatchesExecutedSample);
+			TestTrue(TEXT("Compute producer written value remains non-zero"),
+				PrimaryPath.Branches[2].ProducerWrittenValue.Contains(TEXT("0.133")));
+		}
+
+		FEventContextEvidence SameNameResources;
+		SameNameResources.EventId = 200;
+		AddInput(SameNameResources, 2068, TEXT("Composite.PrimitivesDepthHistory"), TEXT("PrevHistoryTexture"), TEXT("read"));
+		AddInput(SameNameResources, 2298, TEXT("Composite.PrimitivesDepthHistory"), TEXT("CurrentHistoryTexture"), TEXT("read-write"));
+		SameNameResources.ResourcePixelHistories.Add(MakeValueFlowHistory(TEXT("Composite.PrimitivesDepthHistory"), 2068,
+			TEXT("PrevHistoryTexture"), 0, false, 0, 0, 0, 0, TEXT("no-modification-before-consumer")));
+		SameNameResources.ResourcePixelHistories.Add(MakeValueFlowHistory(TEXT("Composite.PrimitivesDepthHistory"), 2298,
+			TEXT("CurrentHistoryTexture"), 0, false, 0, 0, 0, 0, TEXT("no-modification-before-consumer")));
+		TMap<uint32, FEventContextEvidence> IdentityContexts;
+		IdentityContexts.Add(SameNameResources.EventId, SameNameResources);
+		TMap<uint32, int32> IdentityDepths;
+		IdentityDepths.Add(SameNameResources.EventId, 0);
+		const TArray<FCausalLaneEvidence> IdentityLanes = BuildCausalLaneEvidence(IdentityContexts, IdentityDepths);
+		const FCausalLaneEvidence* IdentityColorLane = IdentityLanes.FindByPredicate([](const FCausalLaneEvidence& Lane)
+		{
+			return Lane.TracePurpose == TEXT("color");
+		});
+		TestNotNull(TEXT("Same-name resource lane exists"), IdentityColorLane);
+		if (IdentityColorLane)
+		{
+			TestEqual(TEXT("Same resource names with different IDs remain separate"), IdentityColorLane->Branches.Num(), 2);
+		}
 		return true;
 	}
 }

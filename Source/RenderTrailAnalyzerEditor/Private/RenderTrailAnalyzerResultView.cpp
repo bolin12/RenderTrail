@@ -448,6 +448,16 @@ namespace UE::RenderTrail::Private
 		{
 			LaneBox->AddSlot().AutoHeight().Padding(0, 0, 0, 3)[MakeChainNode(Node)];
 		}
+		if (!Lane.FullEvidenceText.IsEmpty())
+		{
+			LaneBox->AddSlot().AutoHeight().Padding(0, 5, 0, 0)
+			[
+				MakeExpandableEvidence(
+					Lane.FullEvidenceTitle.IsEmpty() ? TEXT("查看全部确定性分支") : Lane.FullEvidenceTitle,
+					Lane.FullEvidenceText,
+					false)
+			];
+		}
 		ContentBox->AddSlot().AutoHeight().Padding(0, 8, 0, 0)
 		[
 			SNew(SBorder)

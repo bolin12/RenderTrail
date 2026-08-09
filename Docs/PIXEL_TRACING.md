@@ -71,7 +71,9 @@ Load 使用精确 texel。Sample、resolve、缩放和时域路径可能依赖 f
 
 `causalLanes` 按下列键归并：
 
-`tracePurpose + consumer + resource + producer/reset`
+`tracePurpose + consumer + resourceIndex + resourceName + producer/reset`
+
+`resourceIndex` 是资源身份的权威字段，名称只用于展示。同名的输入、输出或历史纹理必须保留为不同节点；只有资源 ID 与事件关系都一致时才允许归并。
 
 每条 UI/Agent 分支使用统一方向：
 
@@ -82,6 +84,35 @@ Load 使用精确 texel。Sample、resolve、缩放和时域路径可能依赖 f
 - `evidenceRecordCount`：原始证据记录，包括 sample、tap 和裁剪边界；
 - `queryRecordCount`：实际发给 RenderDoc 的 Pixel History 查询；
 - grouped branch count：对人和模型展示的语义分支数。
+
+## 最终颜色主路径
+
+`primaryColorPath` 不是把所有颜色输入按事件号串起来，而是从最终物理 writer 开始，逐 hop 选择最能解释当前值的已执行输入。每个候选边至少记录：
+
+- consumer/producer EID 与资源 ID；
+- shader binding 和 read/read-write 访问语义；
+- Shader Debug 实际 sample 值；
+- producer 的 before、shader output 和权威 written value；
+- producer 是否改变该位置的值；
+- 边角色、置信度和停止边界。
+
+主路径选择优先采用实际执行读取且 sample 值与 producer 写后值匹配的边；中性零输入、consumer 自身 read-write 输出和自环不会成为向上游推进的主边。颜色、几何和覆盖旁支仍完整保留，不能因为未进入主路径就删除。
+
+边角色至少包括：
+
+| 角色 | 含义 |
+| --- | --- |
+| `value-changing-producer` | producer 在该位置产生了不同的写后值 |
+| `pass-through-producer` | producer 被执行并写入，但该位置值保持不变 |
+| `neutral-input` | 已执行读取，sample 值为零或对本次输出中性 |
+| `consumer-read-write-output` | 当前 consumer 自己的读写输出，不是上游输入 |
+| `geometry-owner` | 独立的 Depth/可见性几何归属证据 |
+| `external-history-boundary` | 已到跨帧或外部 history，当前 capture 内不能唯一闭合 |
+| `budget-boundary` / `unresolved-boundary` | 因预算或证据不足而停止，不能表述成“没有来源” |
+
+对于 Draw、Copy 和 Compute，Pixel History 的 `lastAfter/postMod` 是资源写后值。`shaderOutput` 只表示 API 能提供的 shader 输出字段；尤其对 Compute，它可能是零或无代表性，不能覆盖实际资源值。
+
+Shader Debug 若证明某条纹理采样指令已执行，并给出 UV、导数/footprint 与 sample 结果，即可构成强执行读取证据。只有在宣称“唯一精确上游 texel”时，才要求精确整数坐标；bounded footprint 不应被降级成“未证明读取”。
 
 ## 当前安全预算
 
