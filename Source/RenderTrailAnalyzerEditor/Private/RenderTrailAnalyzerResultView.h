@@ -28,6 +28,14 @@ namespace UE::RenderTrail::Private
 		FString Subtitle;
 	};
 
+	struct FRenderTrailResultLane
+	{
+		FString Kind;
+		FString Title;
+		FString Summary;
+		TArray<FRenderTrailResultNode> Nodes;
+	};
+
 	struct FRenderTrailAgentResultViewModel
 	{
 		FString Question;
@@ -44,6 +52,7 @@ namespace UE::RenderTrail::Private
 		FString ColorDeltaText;
 		TArray<FRenderTrailResultFact> Facts;
 		TArray<FRenderTrailResultNode> Chain;
+		TArray<FRenderTrailResultLane> Lanes;
 		FString ProcessText;
 		FString PipelineText;
 		FString ShaderText;
@@ -68,7 +77,8 @@ namespace UE::RenderTrail::Private
 		TSharedRef<SWidget> MakeChainNode(const FRenderTrailResultNode& Node) const;
 		TSharedRef<SWidget> MakeExpandableEvidence(const FString& Title, const FString& Body, bool bInitiallyExpanded = false) const;
 		TSharedRef<SWidget> MakeColorSwatch(const FLinearColor& Color, const FString& Label) const;
-		void AddChain(const TArray<FRenderTrailResultNode>& Nodes);
+		void AddChain(const TArray<FRenderTrailResultNode>& Nodes, const FString& Title = TEXT("最终 RT 写入"));
+		void AddLane(const FRenderTrailResultLane& Lane);
 
 		TSharedPtr<SVerticalBox> ContentBox;
 	};

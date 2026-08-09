@@ -30,4 +30,5 @@ namespace UE::RenderTrail
 
 	RENDERTRAILCORE_API FString GetMetadataPathForCapture(const FString& CapturePath);
 	RENDERTRAILCORE_API FString GetPreviewPathForCapture(const FString& CapturePath);
+	RENDERTRAILCORE_API FString GetReplayPreviewPathForCapture(const FString& CapturePath);
 }

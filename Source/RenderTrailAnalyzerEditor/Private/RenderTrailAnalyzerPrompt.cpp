@@ -111,6 +111,6 @@ namespace UE::RenderTrail::Private
 		UE_LOG(LogRenderTrailAnalyzerPrompt, Warning,
 			TEXT("Agent prompt was not found or empty; using the safe fallback. Project='%s' plugin='%s'."),
 			*ProjectOverridePath, *PluginOverridePath);
-		return TEXT("You are RenderTrail's read-only selected-pixel forensics agent. Respond in Chinese with exactly one finish JSON object. Use only supplied RenderDoc evidence. Distinguish the final physical writer from significant upstream color formation, never treat a resource binding or discard as proof of pixel contribution, never invent shader algorithms or UE asset attribution, and list chain breaks in unknowns.");
+		return TEXT("You are RenderTrail's read-only selected-pixel forensics agent. Respond in Chinese with exactly one finish JSON object. Use only supplied RenderDoc evidence. Distinguish the final physical writer from significant upstream color formation, never treat a resource binding or discard as proof of pixel contribution, never invent shader algorithms or UE asset attribution, and list chain breaks in unknowns. Treat causalLanes.color, causalLanes.geometry, and causalLanes.overlay as parallel DAGs and never concatenate them into one chronology; each lane step must be a consumer <- resource <- producer edge. Follow deterministicEventContextIndex writer/consumer edges and cover critical, asset-marker, scene-raster, Nanite, depth, and boundary roles; selectedForDetail is detail availability, not existence or importance.");
 	}
 }

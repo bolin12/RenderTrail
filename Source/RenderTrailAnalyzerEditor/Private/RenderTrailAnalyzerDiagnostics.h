@@ -9,7 +9,10 @@ namespace UE::RenderTrail::Private
 		bool bEnabled = true;
 		bool bWorkerProtocol = true;
 		bool bAgentTraffic = true;
-		bool bFullEvidencePayload = true;
+		bool bFullEvidencePayload = false;
+		bool bGpuCrashDiagnostics = false;
+		bool bFastReplay = true;
+		bool bRenderDocDRED = false;
 	};
 
 	class FRenderTrailAnalyzerDiagnostics final
@@ -22,6 +25,7 @@ namespace UE::RenderTrail::Private
 
 		const FRenderTrailDiagnosticsOptions& GetOptions() const { return Options; }
 		bool HasSession() const { return !DiagnosticsFilePath.IsEmpty(); }
+		const FString& GetWorkerDiagnosticsFilePath() const { return WorkerDiagnosticsFilePath; }
 
 	private:
 		static bool ParseBool(const FString& Value, bool DefaultValue);
@@ -31,5 +35,6 @@ namespace UE::RenderTrail::Private
 
 		FRenderTrailDiagnosticsOptions Options;
 		FString DiagnosticsFilePath;
+		FString WorkerDiagnosticsFilePath;
 	};
 }

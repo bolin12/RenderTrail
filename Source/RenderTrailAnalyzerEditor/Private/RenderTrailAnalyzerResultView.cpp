@@ -174,18 +174,27 @@ namespace UE::RenderTrail::Private
 
 		if (!Model.Facts.IsEmpty())
 		{
-			TSharedRef<SHorizontalBox> FactRow = SNew(SHorizontalBox);
-			for (int32 Index = 0; Index < Model.Facts.Num() && Index < 3; ++Index)
+			for (int32 RowStart = 0; RowStart < Model.Facts.Num(); RowStart += 3)
 			{
-				FactRow->AddSlot().FillWidth(1.0f).Padding(Index == 0 ? 0.0f : 3.0f, 0, Index == 2 ? 0.0f : 3.0f, 0)
-				[
-					MakeFactCard(Model.Facts[Index])
-				];
+				TSharedRef<SHorizontalBox> FactRow = SNew(SHorizontalBox);
+				const int32 RowEnd = FMath::Min(RowStart + 3, Model.Facts.Num());
+				for (int32 Index = RowStart; Index < RowEnd; ++Index)
+				{
+					FactRow->AddSlot().FillWidth(1.0f).Padding(Index == RowStart ? 0.0f : 3.0f, 0,
+						Index + 1 == RowEnd ? 0.0f : 3.0f, 0)
+					[
+						MakeFactCard(Model.Facts[Index])
+					];
+				}
+				ContentBox->AddSlot().AutoHeight().Padding(0, 0, 0, 6)[FactRow];
 			}
-			ContentBox->AddSlot().AutoHeight().Padding(0, 0, 0, 9)[FactRow];
 		}
 
-		AddChain(Model.Chain);
+		AddChain(Model.Chain, TEXT("最终 RT 写入"));
+		for (const FRenderTrailResultLane& Lane : Model.Lanes)
+		{
+			AddLane(Lane);
+		}
 
 		if (!Model.UnknownText.IsEmpty())
 		{
@@ -198,7 +207,7 @@ namespace UE::RenderTrail::Private
 		{
 			ContentBox->AddSlot().AutoHeight().Padding(0, 6, 0, 0)
 			[
-				MakeExpandableEvidence(TEXT("已确认的过程"), Model.ProcessText)
+				MakeExpandableEvidence(TEXT("最终 RT 直接过程（Agent）"), Model.ProcessText)
 			];
 		}
 		if (!Model.PipelineText.IsEmpty())
@@ -383,7 +392,7 @@ namespace UE::RenderTrail::Private
 			];
 	}
 
-	void SRenderTrailAnalyzerResultView::AddChain(const TArray<FRenderTrailResultNode>& Nodes)
+	void SRenderTrailAnalyzerResultView::AddChain(const TArray<FRenderTrailResultNode>& Nodes, const FString& Title)
 	{
 		if (!ContentBox.IsValid() || Nodes.IsEmpty())
 		{
@@ -392,7 +401,7 @@ namespace UE::RenderTrail::Private
 		ContentBox->AddSlot().AutoHeight().Padding(0, 1, 0, 6)
 		[
 			SNew(STextBlock)
-			.Text(FText::FromString(TEXT("像素形成链")))
+			.Text(FText::FromString(Title))
 			.Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"), 11))
 			.ColorAndOpacity(FLinearColor(0.78f, 0.84f, 0.91f))
 		];
@@ -409,5 +418,45 @@ namespace UE::RenderTrail::Private
 				];
 			}
 		}
+	}
+
+	void SRenderTrailAnalyzerResultView::AddLane(const FRenderTrailResultLane& Lane)
+	{
+		if (!ContentBox.IsValid())
+		{
+			return;
+		}
+		TSharedRef<SVerticalBox> LaneBox = SNew(SVerticalBox);
+		LaneBox->AddSlot().AutoHeight()
+		[
+			SNew(STextBlock)
+			.Text(FText::FromString(Lane.Title.IsEmpty() ? Lane.Kind : Lane.Title))
+			.Font(FCoreStyle::GetDefaultFontStyle(TEXT("Bold"), 11))
+			.ColorAndOpacity(FLinearColor(0.72f, 0.84f, 0.96f))
+		];
+		if (!Lane.Summary.IsEmpty())
+		{
+			LaneBox->AddSlot().AutoHeight().Padding(0, 3, 0, 6)
+			[
+				SNew(STextBlock)
+				.Text(FText::FromString(Lane.Summary))
+				.AutoWrapText(true)
+				.ColorAndOpacity(FLinearColor(0.60f, 0.68f, 0.77f))
+			];
+		}
+		for (const FRenderTrailResultNode& Node : Lane.Nodes)
+		{
+			LaneBox->AddSlot().AutoHeight().Padding(0, 0, 0, 3)[MakeChainNode(Node)];
+		}
+		ContentBox->AddSlot().AutoHeight().Padding(0, 8, 0, 0)
+		[
+			SNew(SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush(TEXT("WhiteBrush")))
+			.BorderBackgroundColor(FLinearColor(0.038f, 0.045f, 0.058f, 1.0f))
+			.Padding(9.0f)
+			[
+				LaneBox
+			]
+		];
 	}
 }

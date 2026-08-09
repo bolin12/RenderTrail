@@ -1,5 +1,6 @@
 #include "RenderTrailProtocol.h"
 #include "RenderTrailReplayEvidence.h"
+#include "RenderTrailReplayDiagnostics.h"
 
 #include "Dom/JsonObject.h"
 #include "HAL/FileManager.h"
@@ -63,6 +64,43 @@ namespace UE::RenderTrail::Private
 {
 	#if RENDERTRAIL_REPLAY_WORKER_PROGRAM
 	static bool GReplayInitialized = false;
+	using FRenderDocGetLogFileContents = void (RENDERDOC_CC *)(uint64_t, rdcstr&);
+	static FRenderDocGetLogFileContents GRenderDocGetLogFileContents = nullptr;
+	static TArray64<uint8> GRenderDocLogSnapshot;
+
+	static void CaptureRenderDocLogForShutdown()
+	{
+		GRenderDocLogSnapshot.Reset();
+		if (!GRenderDocGetLogFileContents || GetRenderDocDiagnosticsPath().IsEmpty())
+		{
+			return;
+		}
+		rdcstr Contents;
+		GRenderDocGetLogFileContents(0, Contents);
+		if (!Contents.empty())
+		{
+			GRenderDocLogSnapshot.SetNumUninitialized(static_cast<int64>(Contents.size()));
+			FMemory::Memcpy(GRenderDocLogSnapshot.GetData(), Contents.data(), Contents.size());
+		}
+		WriteWorkerDiagnostic(TEXT("renderdoc_log.snapshot"), FString::Printf(
+			TEXT("capturedBytes=%lld path='%s'"), GRenderDocLogSnapshot.Num(),
+			*GetRenderDocDiagnosticsPath()));
+	}
+
+	static void RestoreRenderDocLogAfterShutdown()
+	{
+		if (GetRenderDocDiagnosticsPath().IsEmpty())
+		{
+			GRenderDocLogSnapshot.Reset();
+			return;
+		}
+		const bool bSaved = FFileHelper::SaveArrayToFile(
+			GRenderDocLogSnapshot, *GetRenderDocDiagnosticsPath());
+		WriteWorkerDiagnostic(TEXT("renderdoc_log.preserve"), FString::Printf(
+			TEXT("saved=%s bytes=%lld path='%s'"), bSaved ? TEXT("true") : TEXT("false"),
+			GRenderDocLogSnapshot.Num(), *GetRenderDocDiagnosticsPath()));
+		GRenderDocLogSnapshot.Reset();
+	}
 	#endif
 
 	// PixelHistory itself may inspect more events internally, but no individual query is allowed to
@@ -404,9 +442,12 @@ namespace UE::RenderTrail::Private
 	class FReplaySession
 	{
 	public:
-		explicit FReplaySession(TFunction<void(const FString&)> InMessageCallback, bool InFullDiagnostics)
+		explicit FReplaySession(TFunction<void(const FString&)> InMessageCallback, bool InFullDiagnostics,
+			bool InFastReplay, bool InEnableRenderDocDred)
 			: MessageCallback(MoveTemp(InMessageCallback))
 			, bFullDiagnostics(InFullDiagnostics)
+			, bFastReplay(InFastReplay)
+			, bEnableRenderDocDred(InEnableRenderDocDred)
 		{
 		}
 
@@ -429,11 +470,17 @@ namespace UE::RenderTrail::Private
 			SessionStartSeconds = LoadStartSeconds;
 			auto Report = [&Progress, LoadStartSeconds](const FString& Phase)
 			{
+				WriteWorkerDiagnostic(TEXT("open_capture.phase"), Phase);
 				Progress(Phase, FPlatformTime::Seconds() - LoadStartSeconds);
 			};
 			CapturePath = FPaths::ConvertRelativePathToFull(InCapturePath);
 			PreviewPath = FPaths::ConvertRelativePathToFull(InPreviewPath);
 			Report(TEXT("Validating replay inputs"));
+			WriteWorkerDiagnostic(TEXT("open_capture.preflight"), FString::Printf(
+				TEXT("capture='%s'\npreview='%s'\nfullDiagnostics=%s\nfastReplay=%s\nrenderDocDREDRequested=%s\n%s"),
+				*CapturePath, *PreviewPath, bFullDiagnostics ? TEXT("true") : TEXT("false"),
+				bFastReplay ? TEXT("true") : TEXT("false"),
+				bEnableRenderDocDred ? TEXT("true") : TEXT("false"), *BuildWorkerSystemSnapshot()));
 			if (!FPaths::FileExists(CapturePath))
 			{
 				OutError = FString::Printf(TEXT("Capture does not exist: %s"), *CapturePath);
@@ -457,7 +504,10 @@ namespace UE::RenderTrail::Private
 			const TCHAR* RequiredExports[] = {
 				TEXT("RENDERDOC_AllocArrayMem"), TEXT("RENDERDOC_FreeArrayMem"), TEXT("RENDERDOC_GetVersionString"),
 				TEXT("RENDERDOC_GetCommitHash"), TEXT("RENDERDOC_InitialiseReplay"), TEXT("RENDERDOC_OpenCaptureFile"),
-				TEXT("RENDERDOC_ResourceFormatName"), TEXT("RENDERDOC_ShutdownReplay")};
+				TEXT("RENDERDOC_ResourceFormatName"), TEXT("RENDERDOC_ShutdownReplay"),
+				TEXT("RENDERDOC_SetDebugLogFile"), TEXT("RENDERDOC_GetLogFile"), TEXT("RENDERDOC_GetDriverInformation"),
+				TEXT("RENDERDOC_GetConfigSetting"), TEXT("RENDERDOC_SetConfigSetting"),
+				TEXT("RENDERDOC_GetLogFileContents")};
 			for (const TCHAR* Export : RequiredExports)
 			{
 				if (!FPlatformProcess::GetDllExport(DllHandle, Export))
@@ -468,6 +518,47 @@ namespace UE::RenderTrail::Private
 			}
 			ResourceFormatName = reinterpret_cast<FResourceFormatName>(
 				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_ResourceFormatName")));
+			const FSetDebugLogFile SetDebugLogFile = reinterpret_cast<FSetDebugLogFile>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_SetDebugLogFile")));
+			const FGetLogFile GetLogFile = reinterpret_cast<FGetLogFile>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_GetLogFile")));
+			const FGetConfigSetting GetConfigSetting = reinterpret_cast<FGetConfigSetting>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_GetConfigSetting")));
+			const FSetConfigSetting SetConfigSetting = reinterpret_cast<FSetConfigSetting>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_SetConfigSetting")));
+			const FGetDriverInformation GetDriverInformation = reinterpret_cast<FGetDriverInformation>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_GetDriverInformation")));
+			#if RENDERTRAIL_REPLAY_WORKER_PROGRAM
+			GRenderDocGetLogFileContents = reinterpret_cast<FRenderDocGetLogFileContents>(
+				FPlatformProcess::GetDllExport(DllHandle, TEXT("RENDERDOC_GetLogFileContents")));
+			#endif
+			if (!GetRenderDocLiveDiagnosticsPath().IsEmpty())
+			{
+				const FTCHARToUTF8 RenderDocLogUtf8(*GetRenderDocLiveDiagnosticsPath());
+				SetDebugLogFile(rdcstr(RenderDocLogUtf8.Get()));
+				const char* ActualRenderDocLog = GetLogFile();
+				RenderDocLogPath = ActualRenderDocLog ? UTF8_TO_TCHAR(ActualRenderDocLog) : FString();
+				Report(FString::Printf(TEXT("RenderDoc unique debug log configured: liveRequested='%s' actual='%s' preserved='%s'"),
+					*GetRenderDocLiveDiagnosticsPath(), *RenderDocLogPath, *GetRenderDocDiagnosticsPath()));
+			}
+
+			const SDObject* DredBeforeSetting = GetConfigSetting("D3D12.Debug.EnableDRED");
+			const bool bDredSettingAvailable = DredBeforeSetting != nullptr;
+			const bool bDredBefore = DredBeforeSetting && DredBeforeSetting->AsBool();
+			if (bEnableRenderDocDred)
+			{
+				if (SDObject* DredSetting = SetConfigSetting("D3D12.Debug.EnableDRED"))
+				{
+					DredSetting->data.basic.b = true;
+				}
+			}
+			const SDObject* DredAfterSetting = GetConfigSetting("D3D12.Debug.EnableDRED");
+			const bool bDredEffective = DredAfterSetting && DredAfterSetting->AsBool();
+			Report(FString::Printf(
+				TEXT("RenderDoc DRED configuration: requested=%s settingAvailable=%s previous=%s effective=%s persisted=false"),
+				bEnableRenderDocDred ? TEXT("true") : TEXT("false"),
+				bDredSettingAvailable ? TEXT("true") : TEXT("false"),
+				bDredBefore ? TEXT("true") : TEXT("false"), bDredEffective ? TEXT("true") : TEXT("false")));
 
 			RenderDocVersion = UTF8_TO_TCHAR(RENDERDOC_GetVersionString());
 			RenderDocCommit = UTF8_TO_TCHAR(RENDERDOC_GetCommitHash());
@@ -485,6 +576,9 @@ namespace UE::RenderTrail::Private
 			#endif
 			Report(FString::Printf(TEXT("RenderDoc replay runtime initialised: duration=%.3fs"),
 				FPlatformTime::Seconds() - ReplayInitStartSeconds));
+			const DriverInformation D3D12Driver = GetDriverInformation(GraphicsAPI::D3D12);
+			Report(FString::Printf(TEXT("RenderDoc D3D12 driver information: vendor=%s version='%s'"),
+				*RenderDocEnumToString(D3D12Driver.vendor), UTF8_TO_TCHAR(D3D12Driver.version)));
 
 			Report(TEXT("Creating capture file handle"));
 			ICaptureFile* File = RENDERDOC_OpenCaptureFile();
@@ -507,6 +601,58 @@ namespace UE::RenderTrail::Private
 			}
 			Report(FString::Printf(TEXT("RDC container opened: duration=%.3fs"),
 				FPlatformTime::Seconds() - OpenFileStartSeconds));
+			const int32 SectionCount = File->GetSectionCount();
+			uint64 TotalCompressedSectionBytes = 0;
+			uint64 TotalUncompressedSectionBytes = 0;
+			TArray<FString> SectionDescriptions;
+			SectionDescriptions.Reserve(SectionCount);
+			for (int32 SectionIndex = 0; SectionIndex < SectionCount; ++SectionIndex)
+			{
+				const SectionProperties Properties = File->GetSectionProperties(SectionIndex);
+				TotalCompressedSectionBytes += Properties.compressedSize;
+				TotalUncompressedSectionBytes += Properties.uncompressedSize;
+				SectionDescriptions.Add(FString::Printf(
+					TEXT("[%d] name='%s' type=%s flags=0x%X version=%llu compressed=%llu uncompressed=%llu ratio=%.3f"),
+					SectionIndex, *FromRdcString(Properties.name), *RenderDocEnumToString(Properties.type),
+					static_cast<uint32>(Properties.flags), static_cast<unsigned long long>(Properties.version),
+					static_cast<unsigned long long>(Properties.compressedSize),
+					static_cast<unsigned long long>(Properties.uncompressedSize),
+					Properties.uncompressedSize > 0
+						? static_cast<double>(Properties.compressedSize) / static_cast<double>(Properties.uncompressedSize)
+						: 0.0));
+			}
+			Report(FString::Printf(
+				TEXT("RDC section inventory: count=%d compressedTotal=%llu uncompressedTotal=%llu expansion=%.3fx\n%s"),
+				SectionCount, static_cast<unsigned long long>(TotalCompressedSectionBytes),
+				static_cast<unsigned long long>(TotalUncompressedSectionBytes),
+				TotalCompressedSectionBytes > 0
+					? static_cast<double>(TotalUncompressedSectionBytes) / static_cast<double>(TotalCompressedSectionBytes)
+					: 0.0,
+				SectionDescriptions.IsEmpty() ? TEXT("none") : *FString::Join(SectionDescriptions, TEXT("\n"))));
+			if (CaptureBytes >= 1024LL * 1024LL * 1024LL)
+			{
+				WriteWorkerDiagnostic(TEXT("open_capture.capacity_warning"), FString::Printf(
+					TEXT("largeCapture=true captureBytes=%lld uncompressedSectionBytes=%llu note='OpenCapture must recreate capture resources in this worker while the source application may still retain its own GPU resources.'"),
+					CaptureBytes, static_cast<unsigned long long>(TotalUncompressedSectionBytes)));
+			}
+			const rdcarray<GPUDevice> AvailableGpus = File->GetAvailableGPUs();
+			TArray<FString> GpuDescriptions;
+			for (int32 GpuIndex = 0; GpuIndex < static_cast<int32>(AvailableGpus.size()); ++GpuIndex)
+			{
+				const GPUDevice& Gpu = AvailableGpus[GpuIndex];
+				TArray<FString> ApiNames;
+				for (const GraphicsAPI Api : Gpu.apis)
+				{
+					ApiNames.Add(RenderDocEnumToString(Api));
+				}
+				GpuDescriptions.Add(FString::Printf(
+					TEXT("[%d] name='%s' vendor=%s deviceId=0x%04X driver='%s' apis=[%s]"),
+					GpuIndex, *FromRdcString(Gpu.name), *RenderDocEnumToString(Gpu.vendor), Gpu.deviceID,
+					*FromRdcString(Gpu.driver), *FString::Join(ApiNames, TEXT(","))));
+			}
+			Report(FString::Printf(TEXT("RenderDoc replay GPUs enumerated: count=%llu\n%s"),
+				static_cast<unsigned long long>(AvailableGpus.size()),
+				GpuDescriptions.IsEmpty() ? TEXT("none") : *FString::Join(GpuDescriptions, TEXT("\n"))));
 
 			// A native-size preview captured by the editor is pixel-addressable and must
 			// not be overwritten by RenderDoc's window thumbnail while Replay is opening.
@@ -543,17 +689,35 @@ namespace UE::RenderTrail::Private
 				}
 			}
 
+			ReplayOptions Options;
+			Options.optimisation = bFastReplay
+				? ReplayOptimisationLevel::Fastest
+				: ReplayOptimisationLevel::Balanced;
+			Report(FString::Printf(
+				TEXT("RenderDoc ReplayOptions: apiValidation=%s forceGPUVendor=%s forceGPUDeviceId=0x%04X forceGPUDriverName='%s' optimisation=%s"),
+				Options.apiValidation ? TEXT("true") : TEXT("false"),
+				*RenderDocEnumToString(Options.forceGPUVendor), Options.forceGPUDeviceID,
+				*FromRdcString(Options.forceGPUDriverName), *RenderDocEnumToString(Options.optimisation)));
+			if (bFastReplay)
+			{
+				Report(TEXT("Causal-safe fast replay enabled: valid captured API operations and analysis APIs remain available; RenderDoc may skip debug fills for discarded or otherwise undefined contents, which RenderTrail never accepts as positive pixel-contribution evidence."));
+			}
 			Report(TEXT("RenderDoc OpenCapture begin: creating device, restoring resources, and replaying initial events"));
 			const double OpenCaptureStartSeconds = FPlatformTime::Seconds();
+			WriteWorkerDiagnostic(TEXT("open_capture.system_before"), BuildWorkerSystemSnapshot());
+			FOpenCaptureWatchdog OpenCaptureWatchdog(OpenCaptureStartSeconds);
+			OpenCaptureWatchdog.Start();
 			FCriticalSection ReplayProgressLock;
 			int32 LastProgressBucket = INDEX_NONE;
 			double LastProgressReportSeconds = OpenCaptureStartSeconds;
 			float LastOverallProgress = 0.0f;
 			const RENDERDOC_ProgressCallback ReplayProgress =
-				[&Report, &ReplayProgressLock, &LastProgressBucket, &LastProgressReportSeconds, &LastOverallProgress](float Value)
+				[&Report, &ReplayProgressLock, &LastProgressBucket, &LastProgressReportSeconds,
+					&LastOverallProgress, &OpenCaptureWatchdog](float Value)
 			{
 				FScopeLock Lock(&ReplayProgressLock);
 				const float Clamped = FMath::Clamp(Value, 0.0f, 1.0f);
+				OpenCaptureWatchdog.NotifyProgress(Clamped);
 				LastOverallProgress = Clamped;
 				const int32 Bucket = FMath::FloorToInt(Clamped * 20.0f);
 				const double Now = FPlatformTime::Seconds();
@@ -567,18 +731,42 @@ namespace UE::RenderTrail::Private
 				}
 			};
 			const rdcpair<ResultDetails, IReplayController*> OpenCaptureResult =
-				File->OpenCapture(ReplayOptions(), ReplayProgress);
+				File->OpenCapture(Options, ReplayProgress);
+			OpenCaptureWatchdog.Finish();
 			const double OpenCaptureDuration = FPlatformTime::Seconds() - OpenCaptureStartSeconds;
+			float FinalOverallProgress = 0.0f;
+			{
+				FScopeLock Lock(&ReplayProgressLock);
+				FinalOverallProgress = LastOverallProgress;
+			}
+			const FString OpenCaptureResultMessage = ResultMessage(OpenCaptureResult.first);
 			Report(FString::Printf(TEXT("RenderDoc OpenCapture returned: success=%s duration=%.3fs lastProgress=%s result=%s"),
 				OpenCaptureResult.first.OK() && OpenCaptureResult.second ? TEXT("true") : TEXT("false"),
-				OpenCaptureDuration, *DescribeRenderDocLoadProgress(LastOverallProgress),
-				*ResultMessage(OpenCaptureResult.first)));
+				OpenCaptureDuration, *DescribeRenderDocLoadProgress(FinalOverallProgress),
+				*OpenCaptureResultMessage));
 			if (!OpenCaptureResult.first.OK() || !OpenCaptureResult.second)
 			{
-				OutError = FString::Printf(TEXT("Could not create replay: %s"), *ResultMessage(OpenCaptureResult.first));
+				const int64 RenderDocLogBytes = RenderDocLogPath.IsEmpty()
+					? -1 : IFileManager::Get().FileSize(*RenderDocLogPath);
+				WriteWorkerDiagnostic(TEXT("open_capture.failure"), FString::Printf(
+					TEXT("result=%s\nduration=%.3fs\nlastProgress=%s\ndredEffective=%s\nworkerDiagnostics='%s'\nrenderDocLiveLog='%s'\nrenderDocPreservedLog='%s'\nrenderDocLiveLogBytes=%lld"),
+					*OpenCaptureResultMessage, OpenCaptureDuration,
+					*DescribeRenderDocLoadProgress(FinalOverallProgress),
+					bDredEffective ? TEXT("true") : TEXT("false"), *GetWorkerDiagnosticsPath(),
+					*RenderDocLogPath, *GetRenderDocDiagnosticsPath(), RenderDocLogBytes));
+				// Record the compact failure first. DXGI queries can themselves be slow while
+				// Windows is recovering a removed device, so they must not gate this evidence.
+				WriteWorkerDiagnostic(TEXT("open_capture.system_after_failure"), BuildWorkerSystemSnapshot());
+				WriteWorkerDiagnostic(TEXT("open_capture.recent_gpu_events"), BuildRecentGpuEventSnapshot());
+				OutError = FString::Printf(
+					TEXT("Could not create replay: %s [lastProgress=%s; DRED=%s; workerDiagnostics='%s'; renderDocLog='%s'; renderDocLiveLog='%s']"),
+					*OpenCaptureResultMessage, *DescribeRenderDocLoadProgress(FinalOverallProgress),
+					bDredEffective ? TEXT("enabled") : TEXT("disabled"),
+					*GetWorkerDiagnosticsPath(), *GetRenderDocDiagnosticsPath(), *RenderDocLogPath);
 				File->Shutdown();
 				return false;
 			}
+			WriteWorkerDiagnostic(TEXT("open_capture.system_after_success"), BuildWorkerSystemSnapshot());
 			Controller = OpenCaptureResult.second;
 			File->Shutdown();
 			Report(TEXT("Replay controller created; reading API properties, actions, textures, and resources"));
@@ -651,11 +839,34 @@ namespace UE::RenderTrail::Private
 				}
 				return 0;
 			};
+			auto TextureExtent = [&Textures](ResourceId Candidate) -> FIntPoint
+			{
+				for (const TextureDescription& Texture : Textures)
+				{
+					if (Texture.resourceId == Candidate)
+					{
+						return FIntPoint(static_cast<int32>(Texture.width), static_cast<int32>(Texture.height));
+					}
+				}
+				return FIntPoint::ZeroValue;
+			};
+
+			FIntPoint ExpectedPresentExtent = FIntPoint::ZeroValue;
+			FString MetadataJson;
+			FCaptureMetadata CaptureMetadata;
+			FString MetadataError;
+			if (FFileHelper::LoadFileToString(MetadataJson, *GetMetadataPathForCapture(CapturePath))
+				&& FCaptureMetadata::FromJson(MetadataJson, CaptureMetadata, MetadataError)
+				&& CaptureMetadata.PreviewWidth > 0 && CaptureMetadata.PreviewHeight > 0)
+			{
+				ExpectedPresentExtent = FIntPoint(CaptureMetadata.PreviewWidth, CaptureMetadata.PreviewHeight);
+			}
 
 			// A capture can contain several Present actions when more than one editor,
-			// PIE, notification, or auxiliary window rendered during the frame. Prefer
-			// the largest actual Present output rather than blindly taking the latest
-			// Present, which can be a small warning/notification window.
+			// PIE, notification, or auxiliary window rendered during the frame. The capture
+			// metadata identifies the viewport that initiated this capture, so its exact
+			// extent is a stronger window identity than area alone. Within a tie, walking
+			// backwards keeps the latest Present.
 			uint64 LargestPresentArea = 0;
 			uint32 LargestPresentEventId = 0;
 			for (int32 Index = FlatActions.Num() - 1; Index >= 0; --Index)
@@ -672,7 +883,16 @@ namespace UE::RenderTrail::Private
 					Candidate = ResolveTexture(FirstOutput(Action));
 				}
 				const uint64 CandidateArea = TextureArea(Candidate);
-				if (Candidate != ResourceId() && CandidateArea >= LargestPresentArea)
+				if (Candidate != ResourceId() && ExpectedPresentExtent != FIntPoint::ZeroValue
+					&& TextureExtent(Candidate) == ExpectedPresentExtent)
+				{
+					TargetTexture = Candidate;
+					LargestPresentArea = CandidateArea;
+					LargestPresentEventId = Action.eventId;
+					TargetSelection = TEXT("latest-present-matching-capture-viewport-extent");
+					break;
+				}
+				if (Candidate != ResourceId() && CandidateArea > LargestPresentArea)
 				{
 					TargetTexture = Candidate;
 					LargestPresentArea = CandidateArea;
@@ -682,6 +902,10 @@ namespace UE::RenderTrail::Private
 			if (TargetTexture != ResourceId())
 			{
 				FinalEventId = LargestPresentEventId;
+				if (TargetSelection.IsEmpty())
+				{
+					TargetSelection = TEXT("latest-largest-present");
+				}
 			}
 			// Some injected captures end before DXGI Present. A largest swap-buffer texture
 			// is the next best evidence-backed target in that case; do not select a small
@@ -694,10 +918,11 @@ namespace UE::RenderTrail::Private
 					if (static_cast<bool>(Texture.creationFlags & TextureCategory::SwapBuffer))
 					{
 						const uint64 CandidateArea = static_cast<uint64>(Texture.width) * Texture.height;
-						if (CandidateArea >= LargestSwapBufferArea)
+						if (CandidateArea > LargestSwapBufferArea)
 						{
 							TargetTexture = Texture.resourceId;
 							LargestSwapBufferArea = CandidateArea;
+							TargetSelection = TEXT("largest-swap-buffer-fallback");
 						}
 					}
 				}
@@ -726,6 +951,7 @@ namespace UE::RenderTrail::Private
 					{
 						TargetTexture = Candidate;
 						FinalEventId = Action.eventId;
+						TargetSelection = TEXT("latest-action-output-fallback");
 						break;
 					}
 				}
@@ -742,6 +968,7 @@ namespace UE::RenderTrail::Private
 					{
 						LargestArea = Area;
 						TargetTexture = Texture.resourceId;
+						TargetSelection = TEXT("largest-color-target-fallback");
 					}
 				}
 			}
@@ -782,8 +1009,10 @@ namespace UE::RenderTrail::Private
 				OutError = TEXT("Final texture has invalid dimensions.");
 				return false;
 			}
-			Report(FString::Printf(TEXT("Target texture identified: %s %ux%u; action labels deferred"),
-				TargetName.IsEmpty() ? TEXT("<unnamed>") : *TargetName, Width, Height));
+			Report(FString::Printf(TEXT("Target texture identified: %s %ux%u selection=%s expectedViewport=%dx%d; action labels deferred"),
+				TargetName.IsEmpty() ? TEXT("<unnamed>") : *TargetName, Width, Height,
+				TargetSelection.IsEmpty() ? TEXT("unknown") : *TargetSelection,
+				ExpectedPresentExtent.X, ExpectedPresentExtent.Y));
 
 			if (!bEmbeddedThumbnailExported && IsPixelExactPreviewValid())
 			{
@@ -829,6 +1058,7 @@ namespace UE::RenderTrail::Private
 			Object->SetStringField(TEXT("type"), TEXT("ready"));
 			Object->SetStringField(TEXT("capturePath"), CapturePath);
 			Object->SetStringField(TEXT("previewPath"), PreviewPath);
+			Object->SetStringField(TEXT("previewSource"), TEXT("renderdoc-final-target"));
 			Object->SetNumberField(TEXT("width"), Width);
 			Object->SetNumberField(TEXT("height"), Height);
 			Object->SetNumberField(TEXT("finalEventId"), FinalEventId);
@@ -836,6 +1066,7 @@ namespace UE::RenderTrail::Private
 			Object->SetNumberField(TEXT("targetSamples"), TargetSamples);
 			Object->SetStringField(TEXT("targetName"), TargetName);
 			Object->SetStringField(TEXT("targetFormat"), TargetFormat);
+			Object->SetStringField(TEXT("targetSelection"), TargetSelection);
 			Object->SetStringField(TEXT("renderDocVersion"), RenderDocVersion);
 			Object->SetStringField(TEXT("renderDocCommit"), RenderDocCommit);
 			Object->SetBoolField(TEXT("pixelHistorySupported"), bPixelHistorySupported);
@@ -843,6 +1074,8 @@ namespace UE::RenderTrail::Private
 			Object->SetBoolField(TEXT("previewCached"), bPreviewCached);
 			Object->SetBoolField(TEXT("actionIndexReady"), bActionIndexBuilt);
 			Object->SetBoolField(TEXT("fullDiagnostics"), bFullDiagnostics);
+			Object->SetStringField(TEXT("replayOptimisation"),
+				bFastReplay ? TEXT("Fastest") : TEXT("Balanced"));
 			Emit(Object);
 		}
 
@@ -927,10 +1160,25 @@ namespace UE::RenderTrail::Private
 					*RequestId, ResourceIndex, TextureName.IsEmpty() ? TEXT("<unnamed>") : *TextureName,
 					X, Y, Mip, Slice, SampleIndex, BeforeEventId), RequestId);
 			const double ReplayCallStartSeconds = FPlatformTime::Seconds();
+			const FString ReplayKey = FString::Printf(TEXT("%d:%u:%u:%u:%u:%u:%d"),
+				ResourceIndex, X, Y, Mip, Slice, SampleIndex, static_cast<int32>(TypeCast));
+			rdcarray<PixelModification>* CachedModifications = PixelHistoryCache.Find(ReplayKey);
+			const bool bCacheHit = CachedModifications != nullptr;
 			EmitDiagnostic(TEXT("pixel_history.replay"), TEXT("begin"), ReplayCallStartSeconds,
-				TEXT("Calling IReplayController::PixelHistory"), RequestId);
-			const rdcarray<PixelModification> Modifications = Controller->PixelHistory(
-				TextureId, X, Y, Subresource(Mip, Slice, SampleIndex), TypeCast);
+				FString::Printf(TEXT("cache=%s replayKey=%s"), bCacheHit ? TEXT("hit") : TEXT("miss"), *ReplayKey), RequestId);
+			if (!CachedModifications)
+			{
+				if (PixelHistoryCache.Num() >= MaxCachedPixelHistories)
+				{
+					PixelHistoryCache.Empty();
+					EmitDiagnostic(TEXT("pixel_history.cache"), TEXT("reset"), ReplayCallStartSeconds,
+						FString::Printf(TEXT("limit=%d"), MaxCachedPixelHistories), RequestId);
+				}
+				rdcarray<PixelModification> ReplayModifications = Controller->PixelHistory(
+					TextureId, X, Y, Subresource(Mip, Slice, SampleIndex), TypeCast);
+				CachedModifications = &PixelHistoryCache.Add(ReplayKey, MoveTemp(ReplayModifications));
+			}
+			const rdcarray<PixelModification>& Modifications = *CachedModifications;
 			TArray<const PixelModification*> RelevantModifications;
 			RelevantModifications.Reserve(static_cast<int32>(Modifications.size()));
 			for (const PixelModification& Modification : Modifications)
@@ -943,7 +1191,8 @@ namespace UE::RenderTrail::Private
 			const int32 RawTotal = static_cast<int32>(Modifications.size());
 			const int32 Total = RelevantModifications.Num();
 			EmitDiagnostic(TEXT("pixel_history.replay"), TEXT("end"), ReplayCallStartSeconds,
-				FString::Printf(TEXT("rawModifications=%d relevantModifications=%d"), RawTotal, Total), RequestId);
+				FString::Printf(TEXT("cache=%s rawModifications=%d relevantModifications=%d"),
+					bCacheHit ? TEXT("hit") : TEXT("miss"), RawTotal, Total), RequestId);
 			const int32 First = bFullDiagnostics ? 0 : FMath::Max(0, Total - MaxSerializedPixelModifications);
 			TArray<TSharedPtr<FJsonValue>> JsonModifications;
 			JsonModifications.Reserve(Total - First);
@@ -1322,6 +1571,33 @@ namespace UE::RenderTrail::Private
 			{
 				PipelineState = BuildD3D12PipelineState(*D3D12State);
 				PipelineState->SetBoolField(TEXT("fixedFunctionCaptured"), true);
+				TArray<TSharedPtr<FJsonValue>> VertexBuffers;
+				for (int32 Slot = 0; Slot < static_cast<int32>(D3D12State->inputAssembly.vertexBuffers.size()); ++Slot)
+				{
+					const D3D12Pipe::VertexBuffer& VertexBuffer = D3D12State->inputAssembly.vertexBuffers[Slot];
+					if (VertexBuffer.resourceId == ResourceId())
+					{
+						continue;
+					}
+					const TSharedRef<FJsonObject> Buffer = ResourceToJson(VertexBuffer.resourceId,
+						TEXT("input-assembler"), TEXT("vertex-buffer"));
+					Buffer->SetNumberField(TEXT("slot"), Slot);
+					Buffer->SetNumberField(TEXT("byteOffset"), static_cast<double>(VertexBuffer.byteOffset));
+					Buffer->SetNumberField(TEXT("byteSize"), VertexBuffer.byteSize);
+					Buffer->SetNumberField(TEXT("byteStride"), VertexBuffer.byteStride);
+					VertexBuffers.Add(MakeShared<FJsonValueObject>(Buffer));
+				}
+				PipelineState->SetArrayField(TEXT("vertexBuffers"), MoveTemp(VertexBuffers));
+				if (D3D12State->inputAssembly.indexBuffer.resourceId != ResourceId())
+				{
+					const D3D12Pipe::IndexBuffer& IndexBuffer = D3D12State->inputAssembly.indexBuffer;
+					const TSharedRef<FJsonObject> Buffer = ResourceToJson(IndexBuffer.resourceId,
+						TEXT("input-assembler"), TEXT("index-buffer"));
+					Buffer->SetNumberField(TEXT("byteOffset"), static_cast<double>(IndexBuffer.byteOffset));
+					Buffer->SetNumberField(TEXT("byteSize"), IndexBuffer.byteSize);
+					Buffer->SetNumberField(TEXT("byteStride"), IndexBuffer.byteStride);
+					PipelineState->SetObjectField(TEXT("indexBuffer"), Buffer);
+				}
 				Shader = Stage == ShaderStage::Compute ? D3D12State->computeShader.reflection : D3D12State->pixelShader.reflection;
 			}
 			else if (const D3D11Pipe::State* D3D11State = Controller->GetD3D11PipelineState())
@@ -1370,6 +1646,22 @@ namespace UE::RenderTrail::Private
 			Object->SetBoolField(TEXT("sourceDebugInfo"), bSourceDebugInfo);
 			Object->SetStringField(TEXT("shaderDebugStatus"), ShaderDebugStatus);
 			Object->SetStringField(TEXT("shaderEncoding"), ShaderEncoding);
+			if (SelectedAction)
+			{
+				const TSharedRef<FJsonObject> Draw = MakeShared<FJsonObject>();
+				Draw->SetBoolField(TEXT("drawcall"), static_cast<bool>(SelectedAction->flags & ActionFlags::Drawcall));
+				Draw->SetBoolField(TEXT("indexed"), static_cast<bool>(SelectedAction->flags & ActionFlags::Indexed));
+				Draw->SetBoolField(TEXT("instanced"), static_cast<bool>(SelectedAction->flags & ActionFlags::Instanced));
+				Draw->SetBoolField(TEXT("indirect"), static_cast<bool>(SelectedAction->flags & ActionFlags::Indirect));
+				Draw->SetNumberField(TEXT("numIndicesOrVertices"), SelectedAction->numIndices);
+				Draw->SetNumberField(TEXT("numInstances"), SelectedAction->numInstances);
+				Draw->SetNumberField(TEXT("baseVertex"), SelectedAction->baseVertex);
+				Draw->SetNumberField(TEXT("indexOffset"), SelectedAction->indexOffset);
+				Draw->SetNumberField(TEXT("vertexOffset"), SelectedAction->vertexOffset);
+				Draw->SetNumberField(TEXT("instanceOffset"), SelectedAction->instanceOffset);
+				Object->SetObjectField(TEXT("draw"), Draw);
+				PipelineState->SetObjectField(TEXT("draw"), Draw);
+			}
 			Object->SetNumberField(TEXT("shaderInputSignatureCount"), ShaderInputSignatureCount);
 			Object->SetNumberField(TEXT("shaderOutputSignatureCount"), ShaderOutputSignatureCount);
 			Object->SetNumberField(TEXT("shaderConstantBlockCount"), ShaderConstantBlockCount);
@@ -1386,15 +1678,6 @@ namespace UE::RenderTrail::Private
 					InputResources.Num(), SeenOutputs.Num(), Object->GetArrayField(TEXT("resourceProvenance")).Num()), RequestId);
 			Emit(Object);
 
-			if (FinalEventId > 0)
-			{
-				const double RestoreStartSeconds = FPlatformTime::Seconds();
-				EmitDiagnostic(TEXT("event_context.restore_frame_event"), TEXT("begin"), RestoreStartSeconds,
-					FString::Printf(TEXT("eventId=%u force=true"), FinalEventId), RequestId);
-				Controller->SetFrameEvent(FinalEventId, true);
-				EmitDiagnostic(TEXT("event_context.restore_frame_event"), TEXT("end"), RestoreStartSeconds,
-					FString::Printf(TEXT("eventId=%u"), FinalEventId), RequestId);
-			}
 			EmitDiagnostic(TEXT("event_context"), TEXT("end"), QueryStartSeconds,
 				FString::Printf(TEXT("eventId=%u"), EventId), RequestId);
 		}
@@ -1477,10 +1760,6 @@ namespace UE::RenderTrail::Private
 			if (!Trace)
 			{
 				EmitError(TEXT("shader_debug"), TEXT("RenderDoc could not create a pixel shader debug trace for this event/pixel."), RequestId);
-				if (FinalEventId > 0)
-				{
-					Controller->SetFrameEvent(FinalEventId, true);
-				}
 				return;
 			}
 
@@ -1855,15 +2134,6 @@ namespace UE::RenderTrail::Private
 				BuildShaderCodeEvidence(ShaderDisassembly, ObservedInstructionLines));
 			Controller->FreeTrace(Trace);
 			Emit(Object);
-			if (FinalEventId > 0)
-			{
-				const double RestoreStartSeconds = FPlatformTime::Seconds();
-				EmitDiagnostic(TEXT("shader_debug.restore_frame_event"), TEXT("begin"), RestoreStartSeconds,
-					FString::Printf(TEXT("eventId=%u force=true"), FinalEventId), RequestId);
-				Controller->SetFrameEvent(FinalEventId, true);
-				EmitDiagnostic(TEXT("shader_debug.restore_frame_event"), TEXT("end"), RestoreStartSeconds,
-					FString::Printf(TEXT("eventId=%u"), FinalEventId), RequestId);
-			}
 			EmitDiagnostic(TEXT("shader_debug"), TEXT("end"), QueryStartSeconds,
 				FString::Printf(TEXT("eventId=%u steps=%d"), EventId, StepCount), RequestId);
 		}
@@ -1884,6 +2154,7 @@ namespace UE::RenderTrail::Private
 			ActionKinds.Empty();
 			ActionPaths.Empty();
 			ActionFlagsByEvent.Empty();
+			PixelHistoryCache.Empty();
 			bActionIndexBuilt = false;
 			bPreviewCached = false;
 			// RenderDoc replay must be shut down exactly once, at process exit. In
@@ -1907,6 +2178,8 @@ namespace UE::RenderTrail::Private
 
 		void EmitError(const FString& Stage, const FString& Message, const FString& RequestId = FString()) const
 		{
+			WriteWorkerDiagnostic(FString::Printf(TEXT("error.%s"), *Stage), FString::Printf(
+				TEXT("requestId='%s' message=%s"), *RequestId, *Message));
 			const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 			Object->SetStringField(TEXT("type"), TEXT("error"));
 			Object->SetStringField(TEXT("stage"), Stage);
@@ -1922,6 +2195,11 @@ namespace UE::RenderTrail::Private
 			const FString& Detail, const FString& RequestId = FString()) const
 		{
 			const double Now = FPlatformTime::Seconds();
+			WriteWorkerDiagnostic(FString::Printf(TEXT("diagnostic.%s.%s"), *Stage, *State), FString::Printf(
+				TEXT("stageElapsed=%.3fs sessionElapsed=%.3fs requestId='%s' detail=%s"),
+				FMath::Max(0.0, Now - StageStartSeconds),
+				SessionStartSeconds > 0.0 ? FMath::Max(0.0, Now - SessionStartSeconds) : 0.0,
+				*RequestId, *Detail));
 			const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 			Object->SetStringField(TEXT("type"), TEXT("diagnostic"));
 			Object->SetStringField(TEXT("stage"), Stage);
@@ -1948,6 +2226,11 @@ namespace UE::RenderTrail::Private
 
 	private:
 		using FResourceFormatName = void (RENDERDOC_CC *)(const ResourceFormat&, rdcstr&);
+		using FSetDebugLogFile = void (RENDERDOC_CC *)(const rdcstr&);
+		using FGetLogFile = const char* (RENDERDOC_CC *)();
+		using FGetConfigSetting = const SDObject* (RENDERDOC_CC *)(const rdcstr&);
+		using FSetConfigSetting = SDObject* (RENDERDOC_CC *)(const rdcstr&);
+		using FGetDriverInformation = DriverInformation (RENDERDOC_CC *)(GraphicsAPI);
 
 		bool IsPreviewCacheValid() const
 		{
@@ -2020,8 +2303,10 @@ namespace UE::RenderTrail::Private
 		FString PreviewPath;
 		FString TargetName;
 		FString TargetFormat;
+		FString TargetSelection;
 		FString RenderDocVersion;
 		FString RenderDocCommit;
+		FString RenderDocLogPath;
 		TFunction<void(const FString&)> MessageCallback;
 		double SessionStartSeconds = 0.0;
 		ResourceId TargetTexture;
@@ -2035,14 +2320,18 @@ namespace UE::RenderTrail::Private
 		bool bEmbeddedThumbnailExported = false;
 		bool bActionIndexBuilt = false;
 		bool bFullDiagnostics = false;
+		bool bFastReplay = true;
+		bool bEnableRenderDocDred = false;
 		TMap<uint32, FString> ActionNames;
 		TMap<uint32, FString> ActionKinds;
 		TMap<uint32, FString> ActionPaths;
 		TMap<uint32, uint32> ActionFlagsByEvent;
+		TMap<FString, rdcarray<PixelModification>> PixelHistoryCache;
 		static constexpr int32 MaxSerializedEventResources = 16;
 		static constexpr int32 MaxSerializedTextureAccesses = 64;
 		static constexpr int32 MaxShaderDebugSteps = 4096;
 		static constexpr int32 FullDiagnosticsShaderDebugSteps = 65536;
+		static constexpr int32 MaxCachedPixelHistories = 96;
 	};
 }
 
@@ -2053,10 +2342,11 @@ namespace UE::RenderTrail::Replay
 	void Shutdown();
 
 	bool OpenCapture(const FString& CapturePath, const FString& PreviewPath, bool bFullDiagnostics,
-		FMessageCallback MessageCallback, FString& OutError)
+		bool bFastReplay, bool bEnableRenderDocDred, FMessageCallback MessageCallback, FString& OutError)
 	{
 		Shutdown();
-		GSession = MakeUnique<Private::FReplaySession>(MoveTemp(MessageCallback), bFullDiagnostics);
+		GSession = MakeUnique<Private::FReplaySession>(
+			MoveTemp(MessageCallback), bFullDiagnostics, bFastReplay, bEnableRenderDocDred);
 		Private::FReplaySession* Session = GSession.Get();
 		const auto ReportProgress = [Session](const FString& Phase, double ElapsedSeconds)
 		{
@@ -2085,8 +2375,10 @@ namespace UE::RenderTrail::Replay
 		#if RENDERTRAIL_REPLAY_WORKER_PROGRAM
 		if (Private::GReplayInitialized)
 		{
+			Private::CaptureRenderDocLogForShutdown();
 			RENDERDOC_ShutdownReplay();
 			Private::GReplayInitialized = false;
+			Private::RestoreRenderDocLogAfterShutdown();
 		}
 		#endif
 	}
@@ -2128,8 +2420,11 @@ namespace UE::RenderTrail::Replay
 
 namespace
 {
+	static FCriticalSection GProtocolOutputLock;
+
 	static void WriteProtocolLine(const FString& Line)
 	{
+		FScopeLock Lock(&GProtocolOutputLock);
 		const FTCHARToUTF8 Utf8(*Line);
 		std::fwrite(Utf8.Get(), 1, Utf8.Length(), stdout);
 		std::fputc('\n', stdout);
@@ -2144,6 +2439,9 @@ namespace
 
 	static void WriteProtocolError(const TCHAR* Stage, const FString& Message, const FString& RequestId = FString())
 	{
+		UE::RenderTrail::Private::WriteWorkerDiagnostic(
+			FString::Printf(TEXT("protocol_error.%s"), Stage),
+			FString::Printf(TEXT("requestId='%s' message=%s"), *RequestId, *Message));
 		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 		Object->SetStringField(TEXT("type"), TEXT("error"));
 		Object->SetStringField(TEXT("stage"), Stage);
@@ -2159,6 +2457,8 @@ namespace
 	static void WriteProtocolDiagnostic(const TCHAR* Stage, const TCHAR* State,
 		double StageStartSeconds, const FString& Detail)
 	{
+		UE::RenderTrail::Private::WriteWorkerDiagnostic(
+			FString::Printf(TEXT("protocol_diagnostic.%s.%s"), Stage, State), Detail);
 		const TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 		Object->SetStringField(TEXT("type"), TEXT("diagnostic"));
 		Object->SetStringField(TEXT("stage"), Stage);
@@ -2199,9 +2499,68 @@ namespace
 
 	FString CapturePath;
 	FString PreviewPath;
+	FString WorkerDiagnosticsPath;
 	FParse::Value(FCommandLine::Get(), TEXT("Capture="), CapturePath);
 	FParse::Value(FCommandLine::Get(), TEXT("Preview="), PreviewPath);
+	FParse::Value(FCommandLine::Get(), TEXT("WorkerDiagnostics="), WorkerDiagnosticsPath);
 	const bool bFullDiagnostics = FParse::Param(FCommandLine::Get(), TEXT("RenderTrailFullDiagnostics"));
+	const bool bGpuCrashDiagnosticsExplicit = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailGpuCrashDiagnostics"));
+	const bool bGpuCrashDiagnosticsDisabled = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailDisableGpuCrashDiagnostics"));
+	const bool bGpuCrashDiagnostics = bGpuCrashDiagnosticsExplicit
+		|| (bFullDiagnostics && !bGpuCrashDiagnosticsDisabled);
+	const bool bRenderDocDredExplicit = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailRenderDocDRED"));
+	const bool bRenderDocDredDisabled = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailDisableRenderDocDRED"));
+	const bool bEnableRenderDocDred = bRenderDocDredExplicit && !bRenderDocDredDisabled;
+	const bool bFastReplayExplicit = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailFastReplay"));
+	const bool bBalancedReplayExplicit = FParse::Param(
+		FCommandLine::Get(), TEXT("RenderTrailBalancedReplay"));
+	const bool bFastReplay = bFastReplayExplicit || !bBalancedReplayExplicit;
+	if (bGpuCrashDiagnostics && WorkerDiagnosticsPath.IsEmpty())
+	{
+		FString Directory = FPaths::Combine(FPaths::ProjectLogDir(), TEXT("RenderTrailDiagnostics"));
+		FString CaptureAncestor = FPaths::GetPath(FPaths::ConvertRelativePathToFull(CapturePath));
+		for (int32 ParentDepth = 0; ParentDepth < 5 && !CaptureAncestor.IsEmpty(); ++ParentDepth)
+		{
+			if (FPaths::GetCleanFilename(CaptureAncestor).Equals(TEXT("Saved"), ESearchCase::IgnoreCase))
+			{
+				Directory = FPaths::Combine(CaptureAncestor, TEXT("Logs"), TEXT("RenderTrailDiagnostics"));
+				break;
+			}
+			const FString Parent = FPaths::GetPath(CaptureAncestor);
+			if (Parent == CaptureAncestor)
+			{
+				break;
+			}
+			CaptureAncestor = Parent;
+		}
+		const FString CaptureBase = FPaths::MakeValidFileName(
+			FPaths::GetBaseFilename(CapturePath)).Left(80);
+		WorkerDiagnosticsPath = FPaths::Combine(Directory, FString::Printf(
+			TEXT("RenderTrailReplayWorker_%s_%lld_%u.log"),
+			CaptureBase.IsEmpty() ? TEXT("capture") : *CaptureBase,
+			FDateTime::Now().GetTicks(), FPlatformProcess::GetCurrentProcessId()));
+	}
+	UE::RenderTrail::Private::InitializeWorkerDiagnostics(
+		bGpuCrashDiagnostics ? WorkerDiagnosticsPath : FString());
+	UE::RenderTrail::Private::WriteWorkerDiagnostic(TEXT("worker.startup"), FString::Printf(
+		TEXT("preInitDuration=%.3fs fullDiagnostics=%s gpuCrashDiagnostics=%s gpuCrashDiagnosticsExplicit=%s gpuCrashDiagnosticsDisabled=%s fastReplay=%s fastReplayExplicit=%s balancedReplayExplicit=%s renderDocDRED=%s renderDocDREDExplicit=%s renderDocDREDDisabled=%s commandLine=%s\n%s"),
+		FPlatformTime::Seconds() - PreInitStartSeconds,
+		bFullDiagnostics ? TEXT("true") : TEXT("false"),
+		bGpuCrashDiagnostics ? TEXT("true") : TEXT("false"),
+		bGpuCrashDiagnosticsExplicit ? TEXT("true") : TEXT("false"),
+		bGpuCrashDiagnosticsDisabled ? TEXT("true") : TEXT("false"),
+		bFastReplay ? TEXT("true") : TEXT("false"),
+		bFastReplayExplicit ? TEXT("true") : TEXT("false"),
+		bBalancedReplayExplicit ? TEXT("true") : TEXT("false"),
+		bEnableRenderDocDred ? TEXT("true") : TEXT("false"),
+		bRenderDocDredExplicit ? TEXT("true") : TEXT("false"),
+		bRenderDocDredDisabled ? TEXT("true") : TEXT("false"),
+		FCommandLine::Get(), *UE::RenderTrail::Private::BuildWorkerSystemSnapshot()));
 	if (CapturePath.IsEmpty() || PreviewPath.IsEmpty())
 	{
 		WriteProtocolError(TEXT("startup"), TEXT("Replay Worker requires -Capture= and -Preview= command line arguments."));
@@ -2214,6 +2573,8 @@ namespace
 			CapturePath,
 			PreviewPath,
 			bFullDiagnostics,
+			bFastReplay,
+			bEnableRenderDocDred,
 			[](const FString& JsonLine)
 			{
 				WriteProtocolLine(JsonLine);

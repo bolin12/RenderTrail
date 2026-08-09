@@ -44,6 +44,7 @@ public class RenderTrailReplayWorker : ModuleRules
 		PublicDefinitions.Add("RENDERDOC_PLATFORM_WIN32=1");
 		PublicAdditionalLibraries.Add(Path.Combine(RenderDocRoot, "Lib", "Win64", "renderdoc.lib"));
 		PublicDelayLoadDLLs.Add("renderdoc.dll");
+		PublicSystemLibraries.AddRange(new[] { "dxgi.lib", "wevtapi.lib" });
 		PrivateDependencyModuleNames.AddRange(new[]
 		{
 			"ApplicationCore",

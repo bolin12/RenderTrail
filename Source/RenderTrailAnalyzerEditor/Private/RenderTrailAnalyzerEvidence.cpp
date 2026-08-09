@@ -129,6 +129,427 @@ namespace UE::RenderTrail::Private
 		return Resource;
 	}
 
+	FAgentContextCoverageSelection SelectAgentContextsForCausalCoverage(
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		const TMap<uint32, int32>& EventContextDepths,
+		const TSet<uint32>& CriticalEventIds,
+		int32 MaxDetailedContexts)
+	{
+		FAgentContextCoverageSelection Result;
+		MaxDetailedContexts = FMath::Max(0, MaxDetailedContexts);
+		for (const TPair<uint32, FEventContextEvidence>& Pair : EventContexts)
+		{
+			const FEventContextEvidence& Context = Pair.Value;
+			FAgentContextCoverageEvidence& Coverage = Result.CoverageByEventId.Add(Pair.Key);
+			Coverage.EventId = Pair.Key;
+			Coverage.ReverseDepth = EventContextDepths.FindRef(Pair.Key);
+			Coverage.bCritical = CriticalEventIds.Contains(Pair.Key);
+
+			FString Searchable = Context.MarkerPath + TEXT(" ") + Context.Action + TEXT(" ") + Context.ShaderEntry;
+			for (const FBoundResourceEvidence& Resource : Context.Inputs)
+			{
+				Searchable += TEXT(" ") + Resource.Name + TEXT(" ") + Resource.ShaderBinding;
+			}
+			for (const FBoundResourceEvidence& Resource : Context.Outputs)
+			{
+				Searchable += TEXT(" ") + Resource.Name;
+			}
+			auto Contains = [&Searchable](const TCHAR* Token)
+			{
+				return Searchable.Contains(Token, ESearchCase::IgnoreCase);
+			};
+			Coverage.bAssetMarker = Contains(TEXT("/Game/")) || Contains(TEXT("/Engine/"))
+				|| Contains(TEXT(" SM_")) || Contains(TEXT(" SK_"))
+				|| Contains(TEXT(" SkeletalMesh_"));
+			Coverage.bSceneRaster = Contains(TEXT("BasePass")) || Contains(TEXT("PrePass"))
+				|| Contains(TEXT("DepthPass")) || Contains(TEXT("GBuffer"));
+			Coverage.bNanite = Contains(TEXT("Nanite")) || Contains(TEXT("MicropolyRasterize"))
+				|| Contains(TEXT("VisBuffer"));
+			Coverage.bDepthStage = Contains(TEXT("SceneDepth")) || Contains(TEXT("DepthPass"))
+				|| Contains(TEXT("PrePass")) || Contains(TEXT("HZB")) || Contains(TEXT("EmitSceneDepth"));
+		}
+
+		for (const TPair<uint32, FEventContextEvidence>& Pair : EventContexts)
+		{
+			FAgentContextCoverageEvidence& ConsumerCoverage =
+				Result.CoverageByEventId.FindChecked(Pair.Key);
+			for (const TSharedPtr<FJsonValue>& HistoryValue : Pair.Value.ResourcePixelHistories)
+			{
+				const TSharedPtr<FJsonObject> History = HistoryValue.IsValid() ? HistoryValue->AsObject() : nullptr;
+				if (!History.IsValid())
+				{
+					continue;
+				}
+				FString BranchStatus;
+				History->TryGetStringField(TEXT("branchStatus"), BranchStatus);
+				if (!BranchStatus.IsEmpty()
+					&& BranchStatus != TEXT("continued-to-dominating-writer")
+					&& BranchStatus != TEXT("continued-to-pixel-writer")
+					&& BranchStatus != TEXT("adaptive-footprint-continued")
+					&& BranchStatus != TEXT("no-modification-before-consumer"))
+				{
+					ConsumerCoverage.bBranchBoundary = true;
+				}
+
+				double SelectedWriterEventIdValue = 0.0;
+				if (History->TryGetNumberField(TEXT("selectedWriterEventId"), SelectedWriterEventIdValue))
+				{
+					const uint32 WriterEventId = static_cast<uint32>(SelectedWriterEventIdValue);
+					if (WriterEventId != 0 && WriterEventId != Pair.Key)
+					{
+						ConsumerCoverage.ProducerEventIds.AddUnique(WriterEventId);
+						if (FAgentContextCoverageEvidence* WriterCoverage =
+							Result.CoverageByEventId.Find(WriterEventId))
+						{
+							WriterCoverage->bReferencedPixelWriter = true;
+							WriterCoverage->DownstreamConsumerEventIds.AddUnique(Pair.Key);
+						}
+						else
+						{
+							ConsumerCoverage.bUnresolvedProducer = true;
+						}
+					}
+				}
+
+				const TArray<TSharedPtr<FJsonValue>>* EventSummaries = nullptr;
+				if (History->TryGetArrayField(TEXT("eventSummaries"), EventSummaries) && EventSummaries)
+				{
+					for (const TSharedPtr<FJsonValue>& EventValue : *EventSummaries)
+					{
+						const TSharedPtr<FJsonObject> Event = EventValue.IsValid() ? EventValue->AsObject() : nullptr;
+						if (!Event.IsValid())
+						{
+							continue;
+						}
+						double EventIdValue = 0.0;
+						if (!Event->TryGetNumberField(TEXT("eventId"), EventIdValue))
+						{
+							continue;
+						}
+						FAgentContextCoverageEvidence* EventCoverage =
+							Result.CoverageByEventId.Find(static_cast<uint32>(EventIdValue));
+						if (!EventCoverage)
+						{
+							continue;
+						}
+						double Passed = 0.0;
+						double Rejected = 0.0;
+						bool bChanged = false;
+						Event->TryGetNumberField(TEXT("passedFragments"), Passed);
+						Event->TryGetNumberField(TEXT("rejectedFragments"), Rejected);
+						Event->TryGetBoolField(TEXT("changedTextureValue"), bChanged);
+						EventCoverage->PassedFragments = FMath::Max(
+							EventCoverage->PassedFragments, static_cast<int32>(Passed));
+						EventCoverage->RejectedFragments = FMath::Max(
+							EventCoverage->RejectedFragments, static_cast<int32>(Rejected));
+						EventCoverage->bChangedTextureValue |= bChanged;
+					}
+				}
+			}
+		}
+
+		TArray<uint32> CausalQueue;
+		for (const uint32 CriticalEventId : CriticalEventIds)
+		{
+			if (FAgentContextCoverageEvidence* Coverage = Result.CoverageByEventId.Find(CriticalEventId))
+			{
+				Coverage->CausalDistance = 0;
+				CausalQueue.Add(CriticalEventId);
+			}
+		}
+		for (int32 QueueIndex = 0; QueueIndex < CausalQueue.Num(); ++QueueIndex)
+		{
+			const uint32 ConsumerEventId = CausalQueue[QueueIndex];
+			const FAgentContextCoverageEvidence& Consumer =
+				Result.CoverageByEventId.FindChecked(ConsumerEventId);
+			for (const uint32 ProducerEventId : Consumer.ProducerEventIds)
+			{
+				FAgentContextCoverageEvidence* Producer = Result.CoverageByEventId.Find(ProducerEventId);
+				if (Producer && Producer->CausalDistance > Consumer.CausalDistance + 1)
+				{
+					Producer->CausalDistance = Consumer.CausalDistance + 1;
+					CausalQueue.Add(ProducerEventId);
+				}
+			}
+		}
+
+		for (TPair<uint32, FAgentContextCoverageEvidence>& Pair : Result.CoverageByEventId)
+		{
+			FAgentContextCoverageEvidence& Coverage = Pair.Value;
+			Coverage.ProducerEventIds.Sort([](uint32 A, uint32 B) { return A > B; });
+			Coverage.DownstreamConsumerEventIds.Sort([](uint32 A, uint32 B) { return A > B; });
+			Coverage.PriorityScore = Coverage.bCritical ? 1000000 : 0;
+			if (Coverage.CausalDistance != MAX_int32)
+			{
+				Coverage.PriorityScore += FMath::Max<int64>(0, 220000 - Coverage.CausalDistance * 10000LL);
+			}
+			Coverage.PriorityScore += Coverage.bReferencedPixelWriter ? 120000 : 0;
+			Coverage.PriorityScore += Coverage.bChangedTextureValue ? 90000 : 0;
+			Coverage.PriorityScore += Coverage.PassedFragments > 0 ? 70000 : 0;
+			Coverage.PriorityScore += Coverage.bAssetMarker ? 60000 : 0;
+			Coverage.PriorityScore += Coverage.bSceneRaster ? 50000 : 0;
+			Coverage.PriorityScore += Coverage.bNanite ? 45000 : 0;
+			Coverage.PriorityScore += Coverage.bDepthStage ? 35000 : 0;
+			Coverage.PriorityScore += Coverage.bBranchBoundary || Coverage.bUnresolvedProducer ? 25000 : 0;
+			Coverage.PriorityScore += FMath::Min(Coverage.ReverseDepth, 32) * 250LL;
+			if (Coverage.RejectedFragments > 0 && Coverage.PassedFragments == 0
+				&& !Coverage.bChangedTextureValue)
+			{
+				Coverage.PriorityScore -= 30000;
+			}
+		}
+
+		auto AddSelected = [&Result, MaxDetailedContexts](uint32 EventId, const FString& Reason)
+		{
+			if (!Result.CoverageByEventId.Contains(EventId))
+			{
+				return false;
+			}
+			if (Result.DetailedEventIds.Contains(EventId))
+			{
+				Result.SelectionReasons.FindOrAdd(EventId).AddUnique(Reason);
+				return true;
+			}
+			if (Result.DetailedEventIds.Num() >= MaxDetailedContexts)
+			{
+				return false;
+			}
+			Result.DetailedEventIds.Add(EventId);
+			Result.SelectionReasons.FindOrAdd(EventId).Add(Reason);
+			return true;
+		};
+
+		TArray<uint32> RankedIds;
+		Result.CoverageByEventId.GenerateKeyArray(RankedIds);
+		RankedIds.Sort([&Result](uint32 A, uint32 B)
+		{
+			const FAgentContextCoverageEvidence& CoverageA = Result.CoverageByEventId.FindChecked(A);
+			const FAgentContextCoverageEvidence& CoverageB = Result.CoverageByEventId.FindChecked(B);
+			return CoverageA.PriorityScore == CoverageB.PriorityScore
+				? A > B : CoverageA.PriorityScore > CoverageB.PriorityScore;
+		});
+
+		for (const uint32 EventId : RankedIds)
+		{
+			if (Result.CoverageByEventId.FindChecked(EventId).bCritical)
+			{
+				AddSelected(EventId, TEXT("critical-final-or-significant-writer"));
+			}
+		}
+
+		auto AddBestCoverage = [&RankedIds, &Result, &AddSelected](
+			const FString& Reason, TFunctionRef<bool(const FAgentContextCoverageEvidence&)> Predicate,
+			bool bRequireUnselected = false)
+		{
+			for (const uint32 EventId : RankedIds)
+			{
+				const FAgentContextCoverageEvidence& Coverage = Result.CoverageByEventId.FindChecked(EventId);
+				if (Predicate(Coverage)
+					&& (!bRequireUnselected || !Result.DetailedEventIds.Contains(EventId)))
+				{
+					AddSelected(EventId, Reason);
+					return;
+				}
+			}
+		};
+
+		AddBestCoverage(TEXT("asset-marker-pixel-writer"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bAssetMarker && (Coverage.PassedFragments > 0 || Coverage.bChangedTextureValue);
+		});
+		AddBestCoverage(TEXT("basepass-prepass-gbuffer-coverage"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bSceneRaster;
+		});
+		AddBestCoverage(TEXT("nanite-visibility-or-raster-coverage"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bNanite;
+		});
+		AddBestCoverage(TEXT("nanite-writer-diversity"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bNanite && (Coverage.PassedFragments > 0 || Coverage.bChangedTextureValue);
+		}, true);
+		AddBestCoverage(TEXT("depth-chain-coverage"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bDepthStage;
+		});
+		AddBestCoverage(TEXT("explicit-chain-boundary"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bBranchBoundary || Coverage.bUnresolvedProducer;
+		});
+		AddBestCoverage(TEXT("direct-confirmed-writer-hop"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.CausalDistance == 1;
+		}, true);
+		AddBestCoverage(TEXT("second-confirmed-writer-hop"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.CausalDistance == 1;
+		}, true);
+		AddBestCoverage(TEXT("deeper-confirmed-writer-hop"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.CausalDistance >= 2 && Coverage.CausalDistance != MAX_int32;
+		}, true);
+		AddBestCoverage(TEXT("deep-frontier-coverage"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.ReverseDepth >= 4 && (Coverage.bReferencedPixelWriter || Coverage.bAssetMarker
+				|| Coverage.bSceneRaster || Coverage.bNanite || Coverage.bDepthStage);
+		}, true);
+		AddBestCoverage(TEXT("asset-marker-rejection-or-candidate"), [](const FAgentContextCoverageEvidence& Coverage)
+		{
+			return Coverage.bAssetMarker;
+		}, true);
+
+		for (const uint32 EventId : RankedIds)
+		{
+			if (Result.DetailedEventIds.Num() >= MaxDetailedContexts)
+			{
+				break;
+			}
+			AddSelected(EventId, TEXT("coverage-score-fill"));
+		}
+		return Result;
+	}
+
+	TArray<FCausalLaneEvidence> BuildCausalLaneEvidence(
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		const TMap<uint32, int32>& EventContextDepths)
+	{
+		auto StatusRank = [](const FString& Status)
+		{
+			if (Status.Contains(TEXT("failed"), ESearchCase::IgnoreCase)) return 90;
+			if (Status.Contains(TEXT("budget"), ESearchCase::IgnoreCase)
+				|| Status.Contains(TEXT("limit"), ESearchCase::IgnoreCase)
+				|| Status.Contains(TEXT("pruned"), ESearchCase::IgnoreCase)) return 80;
+			if (Status == TEXT("geometry-reset-boundary")) return 70;
+			if (Status == TEXT("no-modification-before-consumer")) return 60;
+			if (Status == TEXT("continued-to-dominating-writer")) return 50;
+			if (Status == TEXT("adaptive-footprint-continued")) return 10;
+			return 20;
+		};
+		auto ConfidenceRank = [](const FString& Confidence)
+		{
+			if (Confidence == TEXT("confirmed-executed-values")) return 50;
+			if (Confidence.Contains(TEXT("confirmed-executed-uv"), ESearchCase::IgnoreCase)) return 40;
+			if (Confidence == TEXT("same-extent")) return 30;
+			if (Confidence == TEXT("candidate")) return 10;
+			return 0;
+		};
+
+		TMap<FString, FCausalLaneEvidence> LanesByPurpose;
+		TMap<FString, TMap<FString, int32>> BranchIndicesByPurpose;
+		for (const TPair<uint32, FEventContextEvidence>& Pair : EventContexts)
+		{
+			const FEventContextEvidence& Context = Pair.Value;
+			for (const TSharedPtr<FJsonValue>& HistoryValue : Context.ResourcePixelHistories)
+			{
+				const TSharedPtr<FJsonObject> History = HistoryValue.IsValid() ? HistoryValue->AsObject() : nullptr;
+				if (!History.IsValid())
+				{
+					continue;
+				}
+
+				FString Purpose = TEXT("color");
+				FString ResourceName = TEXT("unknown-resource");
+				FString BranchStatus;
+				FString MappingConfidence;
+				double ProducerEventId = 0.0;
+				double ResetBoundaryEventId = 0.0;
+				double Sample = 0.0;
+				double CollapsedAccessCount = 0.0;
+				History->TryGetStringField(TEXT("tracePurpose"), Purpose);
+				History->TryGetStringField(TEXT("resourceName"), ResourceName);
+				History->TryGetStringField(TEXT("branchStatus"), BranchStatus);
+				History->TryGetStringField(TEXT("mappingConfidence"), MappingConfidence);
+				History->TryGetNumberField(TEXT("selectedWriterEventId"), ProducerEventId);
+				History->TryGetNumberField(TEXT("resetBoundaryEventId"), ResetBoundaryEventId);
+				History->TryGetNumberField(TEXT("sample"), Sample);
+				History->TryGetNumberField(TEXT("collapsedShaderAccessCount"), CollapsedAccessCount);
+				if (Purpose.IsEmpty())
+				{
+					Purpose = TEXT("color");
+				}
+				const bool bBoundaryOnlyRecord = BranchStatus.Contains(TEXT("pruned"), ESearchCase::IgnoreCase)
+					|| BranchStatus.Contains(TEXT("budget-exhausted"), ESearchCase::IgnoreCase)
+					|| BranchStatus.Contains(TEXT("sample-limit"), ESearchCase::IgnoreCase)
+					|| BranchStatus.Contains(TEXT("resource-limit"), ESearchCase::IgnoreCase);
+
+				FCausalLaneEvidence& Lane = LanesByPurpose.FindOrAdd(Purpose);
+				Lane.TracePurpose = Purpose;
+				++Lane.EvidenceRecordCount;
+				Lane.QueryRecordCount += bBoundaryOnlyRecord ? 0 : 1;
+				const uint32 ProducerId = static_cast<uint32>(FMath::Max(0.0, ProducerEventId));
+				const uint32 ResetId = static_cast<uint32>(FMath::Max(0.0, ResetBoundaryEventId));
+				const FString BranchKey = FString::Printf(TEXT("%u|%s|%u|%u"),
+					Context.EventId, *ResourceName, ProducerId, ResetId);
+				TMap<FString, int32>& BranchIndices = BranchIndicesByPurpose.FindOrAdd(Purpose);
+				int32* ExistingIndex = BranchIndices.Find(BranchKey);
+				if (!ExistingIndex)
+				{
+					FCausalLaneBranchEvidence Branch;
+					Branch.TracePurpose = Purpose;
+					Branch.ConsumerEventId = Context.EventId;
+					Branch.ProducerEventId = ProducerId;
+					Branch.ResetBoundaryEventId = ResetId;
+					Branch.ReverseDepth = EventContextDepths.FindRef(Context.EventId);
+					Branch.ResourceName = ResourceName;
+					Branch.BranchStatus = BranchStatus;
+					Branch.MappingConfidence = MappingConfidence;
+					Branch.Samples.Add(static_cast<int32>(Sample));
+					Branch.EvidenceRecordCount = 1;
+					Branch.QueryRecordCount = bBoundaryOnlyRecord ? 0 : 1;
+					Branch.CollapsedShaderAccessCount = static_cast<int32>(CollapsedAccessCount);
+					const int32 NewIndex = Lane.Branches.Add(MoveTemp(Branch));
+					BranchIndices.Add(BranchKey, NewIndex);
+					continue;
+				}
+
+				FCausalLaneBranchEvidence& Branch = Lane.Branches[*ExistingIndex];
+				Branch.Samples.AddUnique(static_cast<int32>(Sample));
+				++Branch.EvidenceRecordCount;
+				Branch.QueryRecordCount += bBoundaryOnlyRecord ? 0 : 1;
+				Branch.CollapsedShaderAccessCount = FMath::Max(Branch.CollapsedShaderAccessCount,
+					static_cast<int32>(CollapsedAccessCount));
+				if (StatusRank(BranchStatus) > StatusRank(Branch.BranchStatus))
+				{
+					Branch.BranchStatus = BranchStatus;
+				}
+				if (ConfidenceRank(MappingConfidence) > ConfidenceRank(Branch.MappingConfidence))
+				{
+					Branch.MappingConfidence = MappingConfidence;
+				}
+			}
+		}
+
+		TArray<FCausalLaneEvidence> Result;
+		static const TCHAR* OrderedPurposes[] = { TEXT("color"), TEXT("geometry"), TEXT("overlay") };
+		for (const TCHAR* Purpose : OrderedPurposes)
+		{
+			FCausalLaneEvidence* Lane = LanesByPurpose.Find(Purpose);
+			if (!Lane)
+			{
+				continue;
+			}
+			for (FCausalLaneBranchEvidence& Branch : Lane->Branches)
+			{
+				Branch.Samples.Sort();
+				if (Branch.ProducerEventId > 0) ++Lane->ConfirmedProducerCount;
+				else if (Branch.ResetBoundaryEventId > 0) ++Lane->ResetBoundaryCount;
+				else ++Lane->UnresolvedBoundaryCount;
+			}
+			Lane->Branches.Sort([](const FCausalLaneBranchEvidence& A, const FCausalLaneBranchEvidence& B)
+			{
+				if (A.ReverseDepth != B.ReverseDepth) return A.ReverseDepth < B.ReverseDepth;
+				const bool bAProducer = A.ProducerEventId > 0;
+				const bool bBProducer = B.ProducerEventId > 0;
+				if (bAProducer != bBProducer) return bAProducer;
+				if (A.ConsumerEventId != B.ConsumerEventId) return A.ConsumerEventId > B.ConsumerEventId;
+				return A.ResourceName < B.ResourceName;
+			});
+			Result.Add(MoveTemp(*Lane));
+		}
+		return Result;
+	}
+
 	TArray<FEventEvidence> AggregateEvents(const FPixelSample& Sample)
 	{
 		TArray<FEventEvidence> Events;
@@ -234,6 +655,105 @@ namespace UE::RenderTrail::Private
 		return Event.PassedFragments > 0 || (Event.bDirectShaderWrite && Event.bChangedTextureValue);
 	}
 
+	int32 SelectDominatingWriterSummaryIndex(const TArray<FEventSummaryEvidence>& Events,
+		uint32 ConsumerEventId, const FString& TracePurpose)
+	{
+		if (TracePurpose == TEXT("geometry"))
+		{
+			for (int32 Index = Events.Num() - 1; Index >= 0; --Index)
+			{
+				const FEventSummaryEvidence& Event = Events[Index];
+				if (Event.EventId == 0 || Event.EventId == ConsumerEventId
+					|| (ConsumerEventId > 0 && Event.EventId >= ConsumerEventId))
+				{
+					continue;
+				}
+				if (Event.ActionKind == TEXT("clear"))
+				{
+					const bool bStencilOnlyClear = Event.MarkerPath.Contains(TEXT("ClearStencil"), ESearchCase::IgnoreCase)
+						&& !Event.MarkerPath.Contains(TEXT("ClearDepthStencil"), ESearchCase::IgnoreCase);
+					if (bStencilOnlyClear)
+					{
+						continue;
+					}
+					return Index;
+				}
+				if (Event.ActionKind == TEXT("draw") && Event.PassedFragments > 0
+					&& Event.bChangedTextureValue)
+				{
+					return Index;
+				}
+			}
+			return INDEX_NONE;
+		}
+
+		int32 LatestPassedIndex = INDEX_NONE;
+		for (int32 Index = Events.Num() - 1; Index >= 0; --Index)
+		{
+			const FEventSummaryEvidence& Event = Events[Index];
+			if (Event.EventId == 0 || Event.EventId == ConsumerEventId
+				|| (ConsumerEventId > 0 && Event.EventId >= ConsumerEventId))
+			{
+				continue;
+			}
+			if (Event.bChangedTextureValue)
+			{
+				return Index;
+			}
+			if (LatestPassedIndex == INDEX_NONE && Event.PassedFragments > 0)
+			{
+				LatestPassedIndex = Index;
+			}
+		}
+		return LatestPassedIndex;
+	}
+
+	FString ClassifyResourceTracePurpose(const FString& ResourceName, const FString& ShaderBinding)
+	{
+		const FString Searchable = ResourceName + TEXT(" ") + ShaderBinding;
+		if (Searchable.Contains(TEXT("Editor.Primitives"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("EditorPrimitives"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("SelectionOutline"), ESearchCase::IgnoreCase))
+		{
+			return TEXT("overlay");
+		}
+		if (Searchable.Contains(TEXT("Depth"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("Stencil"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("VisBuffer"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("ShadingMask"), ESearchCase::IgnoreCase)
+			|| Searchable.Contains(TEXT("GPUScene"), ESearchCase::IgnoreCase))
+		{
+			return TEXT("geometry");
+		}
+		return TEXT("color");
+	}
+
+	bool IsSceneSourceEvent(const FString& ActionKind, const FString& MarkerPath)
+	{
+		if (ActionKind != TEXT("draw"))
+		{
+			return false;
+		}
+		return MarkerPath.Contains(TEXT("BasePass"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("PrePass"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("DepthPass"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("GBuffer"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("VisBuffer"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("NaniteRaster"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("Nanite Raster"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("RenderViewEditorPrimitives"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT("/Game/"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT(" SM_"), ESearchCase::IgnoreCase)
+			|| MarkerPath.Contains(TEXT(" SK_"), ESearchCase::IgnoreCase);
+	}
+
+	FString BuildReplayPixelHistoryKey(int32 ResourceIndex, const FIntPoint& Pixel,
+		int32 Mip, int32 Slice, int32 Sample, int32 TypeCast)
+	{
+		return FString::Printf(TEXT("%d:%d:%d:%d:%d:%d:%d"), ResourceIndex, Pixel.X, Pixel.Y,
+			Mip, Slice, Sample, TypeCast);
+	}
+
 	FString ClassifySemantics(const FEventEvidence& Event)
 	{
 		if (Event.bDirectShaderWrite || Event.ActionKind == TEXT("dispatch"))
@@ -282,6 +802,42 @@ namespace UE::RenderTrail::Private
 		}
 		return FString::Printf(TEXT("%s > ... > %s > %s > %s"), *Components[0],
 			*Components[Components.Num() - 3], *Components[Components.Num() - 2], *Components[Components.Num() - 1]);
+	}
+
+	static FString ExtractMarkerIdentifier(const FString& MarkerPath, const TArray<FString>& Prefixes)
+	{
+		for (const FString& Prefix : Prefixes)
+		{
+			int32 SearchFrom = 0;
+			while (SearchFrom < MarkerPath.Len())
+			{
+				const int32 Start = MarkerPath.Find(Prefix, ESearchCase::CaseSensitive, ESearchDir::FromStart, SearchFrom);
+				if (Start == INDEX_NONE)
+				{
+					break;
+				}
+				const bool bTokenBoundary = Start == 0
+					|| (!FChar::IsAlnum(MarkerPath[Start - 1]) && MarkerPath[Start - 1] != TEXT('_'));
+				if (!bTokenBoundary)
+				{
+					SearchFrom = Start + Prefix.Len();
+					continue;
+				}
+				int32 End = Start + Prefix.Len();
+				while (End < MarkerPath.Len())
+				{
+					const TCHAR Character = MarkerPath[End];
+					if (!FChar::IsAlnum(Character) && Character != TEXT('_') && Character != TEXT('-')
+						&& Character != TEXT('.') && Character != TEXT('/'))
+					{
+						break;
+					}
+					++End;
+				}
+				return MarkerPath.Mid(Start, End - Start);
+			}
+		}
+		return FString();
 	}
 
 	TSharedRef<FJsonObject> BuildPixelCausalGraph(
@@ -370,10 +926,22 @@ namespace UE::RenderTrail::Private
 			}
 
 			const TSharedRef<FJsonObject> UnrealAttribution = MakeShared<FJsonObject>();
-			UnrealAttribution->SetStringField(TEXT("material"), TEXT("unknown"));
-			UnrealAttribution->SetStringField(TEXT("mesh"), TEXT("unknown"));
+			const FString MaterialCandidate = ExtractMarkerIdentifier(Event.MarkerPath,
+				{ TEXT("MI_"), TEXT("M_"), TEXT("WorldGridMaterial") });
+			const FString MeshCandidate = ExtractMarkerIdentifier(Event.MarkerPath,
+				{ TEXT("SM_"), TEXT("SK_"), TEXT("SkeletalMesh_") });
+			UnrealAttribution->SetStringField(TEXT("material"),
+				MaterialCandidate.IsEmpty() ? TEXT("unknown") : MaterialCandidate);
+			UnrealAttribution->SetStringField(TEXT("mesh"), MeshCandidate.IsEmpty() ? TEXT("unknown") : MeshCandidate);
 			UnrealAttribution->SetStringField(TEXT("actor"), TEXT("unknown"));
-			UnrealAttribution->SetStringField(TEXT("status"), TEXT("requires-explicit-UE-marker-or-shader-map-evidence"));
+			UnrealAttribution->SetStringField(TEXT("status"),
+				(MaterialCandidate.IsEmpty() && MeshCandidate.IsEmpty())
+					? TEXT("requires-explicit-UE-marker-or-shader-map-evidence")
+					: TEXT("marker-derived-candidate-not-actor-proof"));
+			UnrealAttribution->SetStringField(TEXT("materialConfidence"),
+				MaterialCandidate.IsEmpty() ? TEXT("unknown") : TEXT("candidate-from-marker"));
+			UnrealAttribution->SetStringField(TEXT("meshConfidence"),
+				MeshCandidate.IsEmpty() ? TEXT("unknown") : TEXT("candidate-from-marker"));
 			UnrealAttribution->SetStringField(TEXT("markerEvidence"), CompactMarkerPath(Event.MarkerPath));
 			Hop->SetObjectField(TEXT("ueAttribution"), UnrealAttribution);
 			WriterHops.Add(MakeShared<FJsonValueObject>(Hop));

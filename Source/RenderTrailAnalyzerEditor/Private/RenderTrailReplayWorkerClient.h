@@ -10,7 +10,9 @@ namespace UE::RenderTrail::Private
 		FString ErrorChunk;
 		FString PartialOutput;
 		FString ExitDetail;
+		int32 ReturnCode = 0;
 		bool bExited = false;
+		bool bReturnCodeAvailable = false;
 	};
 
 	struct FRenderTrailReplayWorkerStopResult
@@ -31,12 +33,14 @@ namespace UE::RenderTrail::Private
 		static FString GetDefaultExecutablePath();
 
 		bool Launch(const FString& WorkerPath, const FString& CapturePath, const FString& PreviewPath,
-			bool bFullDiagnostics, FString& OutCommandLine, FString& OutError);
+			bool bFullDiagnostics, bool bGpuCrashDiagnostics, bool bFastReplay, bool bRenderDocDRED,
+			const FString& WorkerDiagnosticsPath, FString& OutCommandLine, FString& OutError);
 		FRenderTrailReplayWorkerStopResult Stop();
 		FRenderTrailReplayWorkerPollResult Poll();
 		bool Write(const FString& Payload);
 
 		bool IsRunning();
+		uint32 GetProcessId() const { return ProcessId; }
 
 	private:
 		void ClosePipes();
@@ -51,6 +55,7 @@ namespace UE::RenderTrail::Private
 		void* StdErrWrite = nullptr;
 		FString OutputBuffer;
 		FString ErrorBuffer;
+		uint32 ProcessId = 0;
 		bool bExitReported = false;
 	};
 }

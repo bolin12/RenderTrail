@@ -11,9 +11,9 @@ Analyzer 内部按职责拆分：`RenderTrailAnalyzerEditorModule` 只负责模�
 
 按照常规方式在项目或引擎中启用插件，然后编译普通 Editor Target。Level Editor 顶部工具栏的 Play 区域会显示一个 **RenderTrail** 图标，与 **Open Neural Rendering Lab** 位于同一区域。点击后，插件会优先恢复上一次编辑器运行遗留的、已经完成但尚未认领的 `.rdc`；如果没有可恢复文件，则按照 Epic 的 Alt+F12 截帧流程执行，但会显式传入当前聚焦的 Game Viewport 或活动 Level Editor Viewport 的原生窗口句柄。在 PIE 运行期间，即使点击工具栏暂时改变了 Slate 焦点，插件仍会保留 Game Viewport 作为截帧目标。插件在同一次 Viewport 绘制后读回原生尺寸画面；等待 `.rdc` 文件大小稳定后，将该画面保存为像素精确预览并写入 UE 上下文，然后在 Unreal Editor 中打开 RenderTrail Analyzer 标签页。这个步骤不创建 RenderDoc ReplayController。
 
-RenderDoc 截帧要求 Epic 的 `RenderDocPlugin` 已附加，并且当前 RHI 受支持。若只截取目标 Viewport，请关闭 **Project Settings > Plugins > RenderDoc > Capture all activity**；开启该选项会有意包含 Slate、所有 Viewport 以及编辑器窗口活动。如果一次截帧包含多个 Present/SwapBuffer 输出，Replay Worker 会选择有证据支持的最大输出，避免误选较小的通知窗口。
+RenderDoc 截帧要求 Epic 的 `RenderDocPlugin` 已附加，并且当前 RHI 受支持。若只截取目标 Viewport，请关闭 **Project Settings > Plugins > RenderDoc > Capture all activity**；开启该选项会有意包含 Slate、所有 Viewport 以及编辑器窗口活动。如果一次截帧包含多个 Present/SwapBuffer 输出，Replay Worker 会优先选择尺寸与截帧 Viewport 元数据完全相同的最新 Present；没有这种候选时才回退到最新的最大 Present，避免误选较小的通知窗口。
 
-`.rdc` 由 RenderDoc 创建在 `Saved/RenderDocCaptures` 下；RenderTrail 在旁边新增 `.rendertrail.json` UE 上下文，并在 `Saved/Previews` 保存同尺寸 PNG，不复制体积较大的截帧。元数据中的 `previewPixelExact`、尺寸和路径用于区分原生 Viewport 预览与 RenderDoc 的窗口缩略图。旧版位于 `Saved/RenderTrail/Captures` 下的截帧仍然受支持。
+`.rdc` 由 RenderDoc 创建在 `Saved/RenderDocCaptures` 下；RenderTrail 在旁边新增 `.rendertrail.json` UE 上下文，不复制体积较大的截帧。`Saved/Previews/<capture>.png` 保存 UE 原生 Viewport 读回，`Saved/Previews/<capture>.renderdoc.png` 保存 Worker 从所选最终目标纹理导出的权威 RT。两个文件从不互相覆盖；元数据中的 `previewPixelExact`、尺寸和路径只描述原生预览。旧版位于 `Saved/RenderTrail/Captures` 下的截帧仍然受支持。
 
 ## 插件归属与构建布局
 
@@ -24,28 +24,30 @@ SDK 可以由插件、宿主项目、Engine 或 `RENDERTRAIL_RENDERDOC_ROOT` 环
 ## 像素检查流程
 
 1. 在 UE 中点击 Level Editor 顶部工具栏的 **RenderTrail** 图标。截帧完成并稳定后，编辑器内的 Analyzer 标签页会自动打开。
-2. 原生最终画面出现后即可选择像素；此时 Replay Worker 尚未启动，也不会额外占用 Replay GPU/内存资源。
+2. Analyzer 可以先显示 UE 原生预览或截帧内嵌缩略图，但这两类图只用于等待期间查看，不接受选点。隔离 Replay Worker 会立即打开截帧并导出权威 RenderDoc 最终 RT。
 3. 使用鼠标滚轮缩放，按住鼠标中键或右键拖动平移。高倍率下，预览会从带过滤的缩略图采样切换为精确的源像素方格，叠加单像素边界，并高亮光标所在单元格，确保点击坐标没有歧义。
-4. 点击一个希望解释的像素，该点记为 `P1`，不会被预先认定为正确、正常或异常。再次点击当前像素会将其清除；点击其他位置会直接替换当前点，旧点的证据不会与新点合并。点击 **分析当前像素** 后才启动隔离 Replay Worker；ReplayController 就绪后自动读取 P1 的 Pixel History。规则分析完成后，可在底部填写问题并点击 **发送**。单纯选择像素不会启动 Replay、查询或 Agent。
+4. 状态显示“RenderDoc 最终 RT 已就绪”后才可点击像素。该点记为 `P1`，不会被预先认定为正确、正常或异常；再次点击会清除，点击其他位置会替换。此时显示图与 Pixel History 的目标纹理、宽高和坐标域一致。点击 **分析当前像素** 后读取 P1 的 Pixel History，并自动深追实际纹理访问足迹、MSAA sample、像素 writer 与 producer 上下文；规则分析完成后，可在底部填写问题并点击 **发送**。单纯选择像素不会启动查询或 Agent。
 5. 右侧检查器默认打开 **结论与链条**：先显示简短结论、Before/After 颜色块、Pass/Pipeline/Shader 摘要，再用“已证明 / 候选 / 断点”节点展示像素形成链。完整事件、资源、Shader 调试和最近 24 个可追踪跳转放在独立的 **技术证据** 页。底部 Agent 输入始终绑定当前 P1；连续追问仅保留上一次问答作为指代理解上下文。点击 **清除** 会清除当前像素和报告。
 
-为控制载荷大小，每个选中像素仅保留最新 256 条详细 Pixel History modification；但 Replay 模块还会针对完整 Pixel History 输出逐事件汇总 `eventSummaries`。如果该汇总缺失或不完整，Analyzer 会停止，而不会根据被截断的尾部证据生成因果结论。
+为控制载荷大小，每个选中像素仅保留最新 256 条详细 Pixel History modification；但 Replay 模块还会针对完整 Pixel History 输出逐事件汇总 `eventSummaries`。技术证据会逐分支显示全部事件汇总，先列通过测试或改变资源值的 Draw，再列 rejected 事件及失败原因。如果该汇总缺失或不完整，Analyzer 会停止，而不会根据被截断的尾部证据生成因果结论。
 
-确定性分析层会自动收集当前像素最多 24 个相关事件的 Pipeline、Shader 和资源上下文，优先收集最终 RT 上最多 10 个已确认写入者，并为每个事件最多展开 3 个实际像素 writer，反向深度最多 10 跳；这些上下文不是由 Agent 选择的。每次分析只处理一个像素，不执行跨点共同链。跨资源时，Analyzer 将状态扩展为 `(resource, pixel, mip, slice, sample, beforeEventId)`：相同或近似尺寸先使用同坐标候选，明显不同尺寸使用归一化像素中心候选；随后直接对输入资源执行逐 sample Pixel History。队列先完成最终写入者和显著上游候选的 Event Context、Shader Debug，以及每个直接输入的 sample 0；Agent 可在这个快速前沿完成后立即整理证据。其余 MSAA sample、其它最终 RT writer 和递归 producer 自动在后台继续有界深追，不会被取消。只有返回实际像素 writer 的分支才继续，空 sample、查询失败与预算边界都会显式记录。DebugPixel 若提供已执行 Load/Sample 指令及坐标变量值，还会把候选映射升级为执行证据；无法恢复坐标时仍保留 candidate，不虚构精确连接。
+确定性分析层采用聚焦的 writer-dominance 递归，默认最多 24 个 Event Context、64 条跨资源 Pixel History、10 跳。最终 RT 和每个资源位置的完整 `eventSummaries` 都保留为可见性历史。每个递归 Draw 都优先执行 DebugPixel：`Load(x,y)` 产生确认坐标；`Sample/SampleLevel(u,v)` 保留真实 UV 和有界 footprint，但同一 `(consumer, resource, mip, slice, sample, typeCast)` 的多条执行访问先合并为一个资源组，优先查询最接近消费位置的代表坐标，只有没有 writer 时才自适应扩展最多 4 个候选。`collapsedShaderAccessCount` 记录合并量，完整指令仍在 Shader Debug。颜色链选择最后改变值的 writer；geometry 链跳过 `ClearStencil`，只把通过且改变 Depth/Visibility 的 Draw 作为 owner，真正的 depth/visibility clear 输出 `geometry-reset-boundary`。Shader Debug 不可用时才从绑定纹理中按 color/geometry/overlay 语义选 2 个回退分支。
 
-报告会明确区分最后物理写入者和显著颜色形成候选。Analyzer 将 RenderDoc 的 Before/After 数值化并计算 `colorDeltaMax`、`colorDeltaL1`；小于一个标准 8-bit 量化步长的变化只作为继续上溯的启发式条件，不作为根因证明。跨资源部分以 `causalGraph` 输出 RT/资源候选、Pass/Event、Pipeline、Shader、producer 关系、逐 sample `resourcePixelHistories`、坐标映射状态和 UE 归属状态。绑定资源本身只算候选输入；某个 sample 的 Pixel History 返回 writer，才证明该输入位置在 consumer 之前确实被写过，仍需结合执行过的 shader access 判断它是否参与最终数学结果。
+Agent 投影额外生成覆盖全部已收集上下文的 `causalLanes`。它按 `(tracePurpose, consumer, resource, producer/reset)` 合并重复 MSAA sample 与自适应坐标记录，同时分别保留 `groupedBranchCount` 和 `queryRecordCount`。结果 UI 将 `color`、`geometry`、`overlay` 显示为并行 DAG 分区；跨分区事件没有默认时间顺序，Mesh 归属不得挂在最终 Composite 事件下。
+
+报告会明确区分最后物理写入者和显著颜色形成候选，并把 `tracePurpose=color`、`geometry`、`overlay` 分别解释为最终颜色形成、几何/可见性归属和编辑器覆盖层。SM_Cylinder 之类 Mesh 证据应从 SceneDepth/Stencil/VisBuffer/GPUScene、Primitive ID 或 UE 资产 Marker 中寻找，不能要求它必须成为最终 RGB 的直接父节点。绑定资源本身只算候选输入；执行过的 shader access、坐标映射和该位置的主导 writer 共同决定递归边。
 
 `.rdc` 不包含现成的 UE 语义因果链。它保存 GPU 命令、资源、Pipeline、Shader 和可用 Marker，Pixel History 由 RenderDoc 回放时重建。RT 写入和资源使用通常可以推导；但精确采样坐标、材质、Mesh 或 Actor 在没有 Shader 调试、源码映射、ShaderMap 或 UE Marker 时可能不可恢复，此时 RenderTrail 会保留 `unknown` 或显式 `chainBreak`。
 
 Analyzer 运行期间，`.rdc` 会保持在 Replay Worker 会话中打开，因此每次像素查询都会复用同一个 Replay 会话。Worker 提供目标资源元数据、任意纹理子资源的 sample-aware Pixel History、完整事件汇总和确定性的有界事件上下文前沿。Event Context 保留 shader binding、descriptor subresource 和 type-cast 信息，不再仅按 ResourceId 合并 Depth/Stencil 等别名。对于选中的末端写入者，如果 Replay 支持，Analyzer 还会自动请求 `DebugPixel`，收集指令/源码映射数量、嵌套常量与资源变量、执行状态样本、变量变化值、调用栈深度、执行标志，以及实际执行的纹理 Load/Sample/Gather 指令与当时可恢复的变量值。这些信息可以证明该点实际执行了什么，但不会假装总能从调试轨迹中恢复高层材质公式。
 
-穿过 copy、resolve 或 resample 资源递归追踪生产者时，仍然受坐标映射证据约束；候选坐标可以用于有界查询，但在 DebugPixel、copy region 或其他执行证据确认前不会被标成精确映射。当前安全预算为每次分析最多 48 个跨资源 Pixel History、每个资源最多 8 个 sample；超出部分会以 `query-budget-exhausted` 或 `sample-limit` 留在报告中，而不是静默消失。
+穿过 copy、resolve 或 resample 资源递归追踪生产者时，仍然受坐标映射证据约束。达到 64 条资源历史、24 个上下文、每事件 12 个不同资源组、每资源 4 个自适应坐标或 2 个回退分支的边界时，会以明确的 branch status 留在报告中。UI 分别显示“资源组”和“候选坐标”，不会把同一 blur 纹理上的几十个 texel 误称为几十个资源。
 
 ## 完整 Replay 诊断
 
-插件还维护一个独立的、不受常规证据限制的诊断会话，用于调查确定性链条中的缺失环节。插件默认配置 `Config/RenderTrailDiagnostics.ini` 会启用该功能，并在 `Saved/Logs/RenderTrailDiagnostics/` 下为每次截帧会话写入一个文件。
+插件维护结构化诊断会话，用于调查确定性链条中的缺失环节。`bEnabled`、Worker 协议和 Agent 诊断默认开启；`bFullEvidencePayload` 与 GPU crash 快照默认关闭。日常模式仍会把每个实际执行的聚焦查询及其响应写入 `Saved/Logs/RenderTrailDiagnostics/` 和 `Saved/RenderTrailTraces/`，完整 payload 模式只用于额外解除长 modification/Shader step 的序列化限制。
 
-诊断文件记录完整的 Analyzer → Worker 请求、Worker 原始 stdout 和 stderr、完整 Pixel History/Event Context/DebugPixel 响应、发送给 Agent 的完整预筛选证据，以及模型请求和响应元数据。常规的 `RenderTrailAgent.log` 和 `gs.log` 仍然会有意限制大小。
+诊断文件记录完整的 Analyzer → Worker 请求、Worker 原始 stdout 和 stderr、完整 Pixel History/Event Context/DebugPixel 响应、发送给 Agent 的完整预筛选证据，以及模型请求和响应元数据。常规的 `RenderTrailAgent.log` 和 `gs.log` 仍然会有意限制大小。启用 GPU 故障诊断时，每次会话还会生成带 PID 和随机后缀的 `RenderTrailReplayWorker_*.log` 以及对应的 `*.renderdoc.log`，不会再依赖 RenderDoc 默认的按秒日志名，因而不会与 crash-handler 或 qrenderdoc 同秒启动的日志互相覆盖。
 
 制作可分发版本时，请在项目中创建 `Config/RenderTrailDiagnostics.ini` 覆盖插件默认值：
 
@@ -55,13 +57,35 @@ bEnabled=false
 bWorkerProtocol=false
 bAgentTraffic=false
 bFullEvidencePayload=false
+bGpuCrashDiagnostics=false
+bFastReplay=true
+bRenderDocDRED=false
 ```
 
 当 `bFullEvidencePayload=true` 时，隔离 Worker 还会解除 Pixel History modification、绑定资源、Shader 变量/源码列表和 DebugPixel 步骤的常规证据限制，同时保留 65,536 个调试步骤的安全上限。该模式用于复现因果链断裂，不适合日常截帧。
 
-Replay 加载和查询还会写入低开销的阶段计时。`progress` 行覆盖 RenderDoc DLL/运行时初始化、RDC 容器、`OpenCapture` 总进度、Replay 元数据、`SetFrameEvent` 和预览导出；其中 `OpenCapture` 按当前 RenderDoc v1.45 的权重标记 debug resource、resource/chunk initialisation 和 frame event replay。`diagnostic` 行以 begin/end 记录 Pixel History、Event Context、DebugPixel、Action Index 与 Replay 关闭耗时。Analyzer 在加载或查询长时间没有完成时每 5 秒写入 `worker_wait`，停止时写入 `worker_stop_complete`，明确区分正常退出和 1 秒等待后的强制终止。上述记录都会保存在对应会话的 `Saved/Logs/RenderTrailDiagnostics/` 文件中。
+Replay 加载和查询还会写入低开销的阶段计时。`progress` 行覆盖 RenderDoc DLL/运行时初始化、RDC 容器、可用 GPU、ReplayOptions、`OpenCapture` 总进度、Replay 元数据、`SetFrameEvent` 和预览导出；其中 `OpenCapture` 按当前 RenderDoc v1.45 的权重标记 debug resource、resource/chunk initialisation 和 frame event replay。`diagnostic` 行以 begin/end 记录 Pixel History、Event Context、DebugPixel、Action Index 与 Replay 关闭耗时。Analyzer 在加载或查询长时间没有完成时每 5 秒写入 `worker_wait`，Worker 自身的独立 watchdog 也每 5 秒写入总体进度、最后一次 progress callback 距今时间和进程内存；停止时写入 `worker_stop_complete`，明确区分正常退出和 1 秒等待后的强制终止。上述记录都会保存在对应会话的 `Saved/Logs/RenderTrailDiagnostics/` 文件中。
 
-查询编排还会记录以下稳定阶段名，便于按 `requestId` 还原等待位置：`worker_request_queued/completed` 是 Analyzer 端总排队时间；`event_context_queued/completed/deferred` 和 `shader_debug_queued/completed` 是模块边界；`trace_schedule_begin/end`、`trace_branch_queued/completed/deduplicated` 是资源/sample 分支；`trace_background_deferred` 与 `background_trace_release_begin/end` 表示快速前沿和后台深追的切换；`agent_evidence_compaction`、`agent_completion_phase`、`ModelActionJsonRepair` 或 `ModelActionLocalFallback` 覆盖模型证据大小、结束原因和结构化恢复结果。Worker 自身的 `pixel_history.replay`、`event_context.set_frame_event/collect/restore_frame_event` 与 `shader_debug.*` begin/end 可进一步区分卡在 RenderDoc 的哪一步。
+日常因果分析默认使用 `bFastReplay=true`，即把 RenderDoc `ReplayOptions.optimisation` 设为 `Fastest`。RenderDoc 对该级别的契约是：只启用不会造成无效或错误 Replay 的优化。当前 D3D12 实现的差异点是避免为 `DiscardResource` 和 `UNDEFINED` transition 额外写入 RenderDoc 的调试填充值；原始 Draw/Dispatch/Copy、资源绑定、Pixel History、Event Context 和 Shader Debug 都不会被关闭。RenderTrail 本来也禁止把 discard/未定义内容当作像素正向贡献证据，因此该优化不会缩短有效因果链。`ready` 消息、状态栏和诊断日志都会记录实际的 `Fastest` 或 `Balanced`。
+
+如果需要对 RenderDoc 的未定义内容可视化做 A/B 对照，可在项目级 `Config/RenderTrailDiagnostics.ini` 中设置：
+
+```ini
+[RenderTrailDiagnostics]
+bFastReplay=false
+```
+
+`bGpuCrashDiagnostics=true` 会在 `OpenCapture` 前后记录操作系统、TDR、相关 Unreal/RenderDoc 进程、DXGI 适配器 LUID、显存预算和当前 Worker 显存占用。失败后还会读取最近五分钟的 `nvlddmkm`、`Display` 与 `Microsoft-Windows-DxgKrnl` System Event XML，并把最后进度、Worker 日志和 RenderDoc 原始日志路径附到结构化错误。`bRenderDocDRED` 默认关闭：DRED Auto Breadcrumb 与 Page Fault 跟踪会增加 GPU 和系统内存开销，不应与每次正常因果 Replay 绑定。只有在稳定复现 `DXGI_ERROR_DEVICE_HUNG/REMOVED` 时才把它设为 `true`；该设置只修改 Worker 中的 RenderDoc 运行时，不调用 `RENDERDOC_SaveConfigSettings`，其它 GPU 快照与实时日志在 DRED 关闭时仍然保留。
+
+为了兼容尚未重载新版 Editor 模块的会话，Worker 收到旧版已有的 `-RenderTrailFullDiagnostics`、但没有显式 GPU 开关时，仍会自动启用 GPU 快照与独立日志，但不会再隐式开启 DRED。新版 Analyzer 总会传入显式 Fast/Balanced 与 DRED enable/disable 参数，因此项目级 `bFastReplay` 和 `bRenderDocDRED` 覆盖不会被兼容回退改变。
+
+隔离 Worker 必须重建 Replay 资源，无法与仍在运行的 Unreal Editor 共享其 D3D12 资源。对超过 1 GiB 的截帧，Fast Replay 和关闭 DRED 可以消除不必要的写入与诊断开销，但不能消除两套资源同时驻留导致的显存超额。如果日志仍显示 dedicated/shared GPU memory 逼近预算，保持因果能力的兜底方式是关闭占用该 GPU 的 qrenderdoc/其它实例，必要时关闭 Editor 后由 Worker 单独加载；不要强制改用不同厂商的 GPU，因为跨驱动 Replay 可能改变取证条件。
+
+查询编排还会记录以下稳定阶段名，便于按 `requestId` 还原等待位置：`worker_request_queued/dispatched/completed` 区分 Analyzer 本地排队、实际写入 Worker 和总完成时间；`analysis_generation_changed`、`selection_state_cleared` 与 `worker_superseded_result_discarded` 记录换点清理边界；`event_context_queued/completed` 和 `shader_debug_queued/completed` 是模块边界；`trace_schedule_begin/end`、`trace_branch_queued/completed/deduplicated` 是资源分支；`agent_evidence_compaction`、`agent_completion_phase`、`ModelActionJsonRepair` 或 `ModelActionLocalFallback` 覆盖模型证据大小、结束原因和结构化恢复结果。Worker 的 `pixel_history.replay` 会记录 Replay key 的 cache hit/miss，`event_context.set_frame_event/collect` 与 `shader_debug.*` begin/end 可进一步区分卡在 RenderDoc 的哪一步。Event Context 和 Shader Debug 完成后不再强制恢复 FinalEvent；下一条依赖管线状态的请求会自行设置目标 Event。
+
+选点标题下方会持续显示历史完整度：资源分支和 writer 上下文分别显示已返回、失败、查询中与安全上限截断数量。“分析当前像素”从一开始就使用 64 条跨资源 Pixel History、24 个 Event Context 的聚焦深追预算；不存在额外的继续深追按钮。Agent 只等待关键前沿，不会被非关键诊断队列拖住。
+
+实时日志标题栏的 **释放 Replay** 只在 Worker 没有待处理请求且 Agent 未运行时可用。它关闭隔离 Worker、回收 Replay 的 GPU/系统内存，但不清除预览、像素证据、确定性报告或 Agent 上下文；日志记录 `manual_replay_release_begin/end`。释放后仍可阅读报告和询问已收集证据；需要重新分析像素时，点击 **分析当前像素** 按需重新载入 Replay并自动深追。
 
 ## Agent 语义整理
 
@@ -87,6 +111,22 @@ Agent System Prompt 已外置到标准 Unreal 风格的 INI 文件 `Plugins/Rend
 
 ## 开发日志
 
+### 2026-08-09 — 因果覆盖式 Agent 证据选择
+
+- 移除详细 Event Context 按“关键事件、浅层优先、同层新 EID 优先”的扁平 Top-N。Analyzer 现在构建覆盖所有已收集上下文的 `deterministicEventContextIndex`，显式保存 confirmed writer/consumer 边、Pixel History 结果、语义角色和详细选择状态。
+- 12 个详细上下文名额按因果覆盖分配：末端关键事件、确认 Pixel Writer、资产 Marker、BasePass/PrePass/GBuffer、Nanite、Depth、链条断点和深层前沿都拥有保留机会；未选上下文仍在轻量索引和本地全量文件中可见。
+- 每个详细上下文中的绑定资源、Provenance 和 Pixel History 不再按插入顺序截取，改为覆盖 SceneColor、Depth、GBuffer、Nanite VisBuffer、GPUScene Primitive/Instance、Material、确认坐标、实际 writer 和失败边界。
+- resource producer 调度在每个 consumer 内先按上述取证语义排序，再展开最多 16 个；剩余 producer 的准确 Event ID 会登记为安全边界，不再静默丢弃。
+- 新增 `RenderTrail.Analyzer.Agent.ContextCausalCoverage` 自动化测试，验证深层 BasePass 资产 writer、Nanite writer 和显式断点不会被较新的浅层后处理噪声挤出详细预算。
+
+### 2026-08-09 — D3D12 Device Lost 取证日志
+
+- 每次 Replay 会话使用 PID 与随机后缀生成独立的 Analyzer、Worker 和 RenderDoc 日志，避免 RenderDoc Worker、crash-handler 或 qrenderdoc 同秒启动时覆盖默认日志。
+- Worker 在 `OpenCapture` 前后记录操作系统、TDR、相关进程、DXGI 适配器/LUID/显存预算、RenderDoc GPU 枚举、驱动版本和实际 ReplayOptions；独立 watchdog 每 5 秒记录总体进度、progress callback 停滞时间和内存。
+- GPU Replay 失败时先落盘结果码、最后阶段和 DRED 状态，再查询 DXGI 快照及最近五分钟的 NVIDIA/Display/DxgKrnl System Event XML，避免驱动恢复期间的次级查询挡住核心错误。
+- GPU 故障诊断模式在 Worker 内临时开启 RenderDoc DRED，但不保存全局设置。RenderDoc 实时写入唯一的 `*.renderdoc.live.log`；正常关闭前读取原始字节并保留为 `*.renderdoc.log`，确保 `DXGI_ERROR_DEVICE_HUNG` 返回后 breadcrumb/page-fault 日志不被析构删除。
+- Analyzer 记录 Worker PID、退出码、最后阶段与独立日志路径；结构化 `open_capture` 错误也直接携带最后加载阶段和两份诊断日志位置。
+
 ### 2026-08-06 — MSAA 逐 sample 因果编排
 
 - Worker 协议升级到 v3；Ready 响应新增最终目标的资源索引、格式和真实 sample 数，避免把 Pass Marker 中的 `MSAA=4` 误当作最终 RT 属性。
@@ -94,7 +134,7 @@ Agent System Prompt 已外置到标准 Unreal 风格的 INI 文件 `Plugins/Rend
 - Event Context 保存 shader binding 与 descriptor 子资源；同一 D32S8 资源的 Depth/Stencil binding 不再因 ResourceId 相同而被合并。
 - DebugPixel 证据新增实际执行的纹理访问指令、嵌套变量值和资源变量；当 Load 坐标与查询像素吻合时，映射可升级为 `confirmed-executed-values`。
 - 每个空 sample、失败查询、writer/context 上限和总查询预算都会以结构化 branch status 保留，避免报告把未展开误写成“没有更早原因”。
-- 快速前沿只阻塞最终写入者、显著上游候选、候选 Shader Debug 和各直接输入的 sample 0；sample 1+、其它上下文及递归 producer 在其后自动后台深追，避免 48 次 Pixel History 串行阻塞 Agent 数分钟。
+- “分析当前像素”自动查询最终写入者、候选 Shader Debug、各直接输入、sample 1+、实际过滤足迹及递归 producer；Agent 等待自动深追收束，安全上限之外的分支以预算边界保留。
 - Analyzer 新增请求排队/完成、关键/后台余量、Event Context、Shader Debug、资源分支与模型阶段日志；Depth/Stencil 等完全相同的底层资源/sample 查询会合并并保留 binding aliases。
 - Agent 证据改为有界紧凑上下文，不再重复携带完整 Shader Trace 和资源历史；模型多写不匹配的 `]` 时执行有界 closer 修复，仍无法解析则展示本地确定性结果，不再把原始 JSON 当作用户错误输出。
 

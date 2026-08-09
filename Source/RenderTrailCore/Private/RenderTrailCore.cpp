@@ -22,6 +22,13 @@ namespace UE::RenderTrail
 			FPaths::GetBaseFilename(CapturePath) + TEXT(".png")));
 	}
 
+	FString GetReplayPreviewPathForCapture(const FString& CapturePath)
+	{
+		return FPaths::ConvertRelativePathToFull(FPaths::Combine(
+			FPaths::GetPath(CapturePath), TEXT(".."), TEXT("Previews"),
+			FPaths::GetBaseFilename(CapturePath) + TEXT(".renderdoc.png")));
+	}
+
 	FString FCaptureMetadata::ToJson() const
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();

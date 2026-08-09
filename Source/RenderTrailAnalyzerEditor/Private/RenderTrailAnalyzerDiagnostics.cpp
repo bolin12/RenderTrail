@@ -1,9 +1,11 @@
 #include "RenderTrailAnalyzerDiagnostics.h"
 
 #include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "Interfaces/IPluginManager.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Guid.h"
 #include "Misc/Paths.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogRenderTrailDiagnostics, Log, All);
@@ -21,6 +23,7 @@ namespace UE::RenderTrail::Private
 	void FRenderTrailAnalyzerDiagnostics::BeginSession(const FString& CapturePath, int64 CaptureSize)
 	{
 		DiagnosticsFilePath.Empty();
+		WorkerDiagnosticsFilePath.Empty();
 		if (!Options.bEnabled)
 		{
 			return;
@@ -28,14 +31,27 @@ namespace UE::RenderTrail::Private
 
 		const FString Directory = FPaths::Combine(FPaths::ProjectLogDir(), TEXT("RenderTrailDiagnostics"));
 		IFileManager::Get().MakeDirectory(*Directory, true);
-		DiagnosticsFilePath = FPaths::Combine(Directory, FString::Printf(TEXT("RenderTrailDiagnostics_%s_%lld.log"),
-			*FPaths::GetBaseFilename(CapturePath), FDateTime::Now().ToUnixTimestamp()));
+		const FString SessionSuffix = FString::Printf(TEXT("%lld_%u_%s"),
+			FDateTime::Now().ToUnixTimestamp(), FPlatformProcess::GetCurrentProcessId(),
+			*FGuid::NewGuid().ToString(EGuidFormats::Digits).Left(8));
+		DiagnosticsFilePath = FPaths::Combine(Directory, FString::Printf(TEXT("RenderTrailDiagnostics_%s_%s.log"),
+			*FPaths::GetBaseFilename(CapturePath), *SessionSuffix));
+		if (Options.bGpuCrashDiagnostics)
+		{
+			WorkerDiagnosticsFilePath = FPaths::Combine(Directory,
+				FString::Printf(TEXT("RenderTrailReplayWorker_%s_%s.log"),
+					*FPaths::GetBaseFilename(CapturePath), *SessionSuffix));
+		}
 		WriteRecord(TEXT("session_start"), FString::Printf(
-			TEXT("capture=%s\nbytes=%lld\nworkerProtocol=%s\nagentTraffic=%s\nfullEvidencePayload=%s"),
+			TEXT("capture=%s\nbytes=%lld\nworkerProtocol=%s\nagentTraffic=%s\nfullEvidencePayload=%s\ngpuCrashDiagnostics=%s\nfastReplay=%s\nrenderDocDRED=%s\nworkerDiagnostics=%s"),
 			*CapturePath, CaptureSize,
 			Options.bWorkerProtocol ? TEXT("true") : TEXT("false"),
 			Options.bAgentTraffic ? TEXT("true") : TEXT("false"),
-			Options.bFullEvidencePayload ? TEXT("true") : TEXT("false")), true);
+			Options.bFullEvidencePayload ? TEXT("true") : TEXT("false"),
+			Options.bGpuCrashDiagnostics ? TEXT("true") : TEXT("false"),
+			Options.bFastReplay ? TEXT("true") : TEXT("false"),
+			Options.bRenderDocDRED ? TEXT("true") : TEXT("false"),
+			WorkerDiagnosticsFilePath.IsEmpty() ? TEXT("disabled") : *WorkerDiagnosticsFilePath), true);
 		UE_LOG(LogRenderTrailDiagnostics, Display, TEXT("RenderTrail full diagnostics: %s"), *DiagnosticsFilePath);
 	}
 
@@ -133,6 +149,18 @@ namespace UE::RenderTrail::Private
 			else if (Key.Equals(TEXT("bFullEvidencePayload"), ESearchCase::IgnoreCase))
 			{
 				InOutOptions.bFullEvidencePayload = ParseBool(Value, InOutOptions.bFullEvidencePayload);
+			}
+			else if (Key.Equals(TEXT("bGpuCrashDiagnostics"), ESearchCase::IgnoreCase))
+			{
+				InOutOptions.bGpuCrashDiagnostics = ParseBool(Value, InOutOptions.bGpuCrashDiagnostics);
+			}
+			else if (Key.Equals(TEXT("bFastReplay"), ESearchCase::IgnoreCase))
+			{
+				InOutOptions.bFastReplay = ParseBool(Value, InOutOptions.bFastReplay);
+			}
+			else if (Key.Equals(TEXT("bRenderDocDRED"), ESearchCase::IgnoreCase))
+			{
+				InOutOptions.bRenderDocDRED = ParseBool(Value, InOutOptions.bRenderDocDRED);
 			}
 		}
 	}

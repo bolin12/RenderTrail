@@ -25,7 +25,9 @@ namespace UE::RenderTrail::Private
 	}
 
 	bool FRenderTrailReplayWorkerClient::Launch(const FString& WorkerPath, const FString& CapturePath,
-		const FString& PreviewPath, bool bFullDiagnostics, FString& OutCommandLine, FString& OutError)
+		const FString& PreviewPath, bool bFullDiagnostics, bool bGpuCrashDiagnostics, bool bFastReplay,
+		bool bRenderDocDRED,
+		const FString& WorkerDiagnosticsPath, FString& OutCommandLine, FString& OutError)
 	{
 		Stop();
 		OutError.Empty();
@@ -41,10 +43,21 @@ namespace UE::RenderTrail::Private
 		const FString WorkerBaseDir = FPaths::ConvertRelativePathToFull(FPaths::Combine(
 			FPaths::ProjectDir(), TEXT("Binaries"), FPlatformProcess::GetBinariesSubdirectory()));
 		const FString FullDiagnosticsArgument = bFullDiagnostics ? TEXT(" -RenderTrailFullDiagnostics") : TEXT("");
-		OutCommandLine = FString::Printf(TEXT("-basedir=\"%s\" -Server -Capture=\"%s\" -Preview=\"%s\"%s"),
-			*WorkerBaseDir, *CapturePath, *PreviewPath, *FullDiagnosticsArgument);
+		const FString GpuCrashDiagnosticsArgument = bGpuCrashDiagnostics
+			? FString::Printf(TEXT(" -RenderTrailGpuCrashDiagnostics -WorkerDiagnostics=\"%s\""),
+				*WorkerDiagnosticsPath)
+			: TEXT(" -RenderTrailDisableGpuCrashDiagnostics");
+		const FString DredArgument = bRenderDocDRED
+			? TEXT(" -RenderTrailRenderDocDRED")
+			: TEXT(" -RenderTrailDisableRenderDocDRED");
+		const FString ReplayOptimisationArgument = bFastReplay
+			? TEXT(" -RenderTrailFastReplay")
+			: TEXT(" -RenderTrailBalancedReplay");
+		OutCommandLine = FString::Printf(TEXT("-basedir=\"%s\" -Server -Capture=\"%s\" -Preview=\"%s\"%s%s%s%s"),
+			*WorkerBaseDir, *CapturePath, *PreviewPath, *FullDiagnosticsArgument,
+			*GpuCrashDiagnosticsArgument, *ReplayOptimisationArgument, *DredArgument);
 
-		ProcessHandle = FPlatformProcess::CreateProc(*WorkerPath, *OutCommandLine, false, true, true, nullptr, 0,
+		ProcessHandle = FPlatformProcess::CreateProc(*WorkerPath, *OutCommandLine, false, true, true, &ProcessId, 0,
 			*WorkerBaseDir, StdOutWrite, StdInRead, StdErrWrite);
 		if (!ProcessHandle.IsValid())
 		{
@@ -93,6 +106,7 @@ namespace UE::RenderTrail::Private
 			FPlatformProcess::CloseProc(ProcessHandle);
 			ProcessHandle.Reset();
 		}
+		ProcessId = 0;
 		ClosePipes();
 		OutputBuffer.Empty();
 		ErrorBuffer.Empty();
@@ -127,6 +141,7 @@ namespace UE::RenderTrail::Private
 		if (!FPlatformProcess::IsProcRunning(ProcessHandle) && !bExitReported)
 		{
 			bExitReported = true;
+			Result.bReturnCodeAvailable = FPlatformProcess::GetProcReturnCode(ProcessHandle, &Result.ReturnCode);
 			if (StdOutRead)
 			{
 				OutputBuffer += FPlatformProcess::ReadPipe(StdOutRead);
@@ -134,9 +149,12 @@ namespace UE::RenderTrail::Private
 			}
 			Result.bExited = true;
 			Result.PartialOutput = OutputBuffer;
+			const FString ReturnCodeDetail = Result.bReturnCodeAvailable
+				? FString::Printf(TEXT("exitCode=%d"), Result.ReturnCode)
+				: TEXT("exitCode=unavailable");
 			Result.ExitDetail = ErrorBuffer.IsEmpty()
-				? TEXT("Replay Worker exited before reporting ready.")
-				: ErrorBuffer.Right(2000);
+				? FString::Printf(TEXT("Replay Worker exited before reporting ready (%s)."), *ReturnCodeDetail)
+				: FString::Printf(TEXT("%s; stderr=%s"), *ReturnCodeDetail, *ErrorBuffer.Right(2000));
 		}
 		return Result;
 	}

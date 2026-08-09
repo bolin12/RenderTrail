@@ -9,8 +9,8 @@ namespace UE::RenderTrail::Private
 	inline constexpr int32 MaxCausalGraphHops = 10;
 	inline constexpr int32 MaxCausalGraphBreaks = 12;
 	inline constexpr int32 MaxCausalGraphResourceEdges = 32;
-	inline constexpr int32 MaxRecursiveProducerContextsPerEvent = 3;
-	inline constexpr int32 MaxInitialEventContexts = 12;
+	inline constexpr int32 MaxRecursiveProducerContextsPerEvent = 1;
+	inline constexpr int32 MaxInitialEventContexts = 2;
 
 	struct FPixelValueEvidence
 	{
@@ -154,6 +154,7 @@ namespace UE::RenderTrail::Private
 		int32 ShaderReadWriteResourceCount = 0;
 		bool bShaderDebuggable = false;
 		bool bSourceDebugInfo = false;
+		FString TraceStopReason;
 		TArray<FBoundResourceEvidence> Inputs;
 		TArray<FBoundResourceEvidence> Outputs;
 		TArray<TSharedPtr<FJsonValue>> ResourceProvenance;
@@ -162,16 +163,85 @@ namespace UE::RenderTrail::Private
 		TSharedPtr<FJsonObject> ShaderDebugTrace;
 	};
 
+	struct FAgentContextCoverageEvidence
+	{
+		uint32 EventId = 0;
+		int32 ReverseDepth = 0;
+		int32 CausalDistance = MAX_int32;
+		int32 PassedFragments = 0;
+		int32 RejectedFragments = 0;
+		int64 PriorityScore = 0;
+		bool bCritical = false;
+		bool bReferencedPixelWriter = false;
+		bool bChangedTextureValue = false;
+		bool bAssetMarker = false;
+		bool bSceneRaster = false;
+		bool bNanite = false;
+		bool bDepthStage = false;
+		bool bBranchBoundary = false;
+		bool bUnresolvedProducer = false;
+		TArray<uint32> ProducerEventIds;
+		TArray<uint32> DownstreamConsumerEventIds;
+	};
+
+	struct FAgentContextCoverageSelection
+	{
+		TArray<uint32> DetailedEventIds;
+		TMap<uint32, TArray<FString>> SelectionReasons;
+		TMap<uint32, FAgentContextCoverageEvidence> CoverageByEventId;
+	};
+
+	struct FCausalLaneBranchEvidence
+	{
+		FString TracePurpose;
+		uint32 ConsumerEventId = 0;
+		uint32 ProducerEventId = 0;
+		uint32 ResetBoundaryEventId = 0;
+		int32 ReverseDepth = 0;
+		FString ResourceName;
+		FString BranchStatus;
+		FString MappingConfidence;
+		TArray<int32> Samples;
+		int32 EvidenceRecordCount = 0;
+		int32 QueryRecordCount = 0;
+		int32 CollapsedShaderAccessCount = 0;
+	};
+
+	struct FCausalLaneEvidence
+	{
+		FString TracePurpose;
+		int32 ConfirmedProducerCount = 0;
+		int32 ResetBoundaryCount = 0;
+		int32 UnresolvedBoundaryCount = 0;
+		int32 EvidenceRecordCount = 0;
+		int32 QueryRecordCount = 0;
+		TArray<FCausalLaneBranchEvidence> Branches;
+	};
+
 	FPixelValueEvidence ParsePixelValue(const TSharedPtr<FJsonObject>& Value);
 	double ComputeColorDeltaMax(const FPixelValueEvidence& Before, const FPixelValueEvidence& After);
 	double ComputeColorDeltaL1(const FPixelValueEvidence& Before, const FPixelValueEvidence& After);
 	FString ClassifyColorDelta(const FEventEvidence& Event);
 	void AddColorDeltaJson(const TSharedRef<FJsonObject>& Json, const FEventEvidence& Event);
 	FBoundResourceEvidence ParseBoundResource(const TSharedPtr<FJsonObject>& Json);
+	FAgentContextCoverageSelection SelectAgentContextsForCausalCoverage(
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		const TMap<uint32, int32>& EventContextDepths,
+		const TSet<uint32>& CriticalEventIds,
+		int32 MaxDetailedContexts);
+	TArray<FCausalLaneEvidence> BuildCausalLaneEvidence(
+		const TMap<uint32, FEventContextEvidence>& EventContexts,
+		const TMap<uint32, int32>& EventContextDepths);
 	TArray<FEventEvidence> AggregateEvents(const FPixelSample& Sample);
 	const FEventEvidence* FindEvent(const TArray<FEventEvidence>& Events, uint32 EventId);
 	FString DescribeEventResult(const FEventEvidence& Event);
 	bool IsConfirmedPixelWriter(const FEventEvidence& Event);
+	int32 SelectDominatingWriterSummaryIndex(const TArray<FEventSummaryEvidence>& Events,
+		uint32 ConsumerEventId, const FString& TracePurpose);
+	FString ClassifyResourceTracePurpose(const FString& ResourceName, const FString& ShaderBinding);
+	bool IsSceneSourceEvent(const FString& ActionKind, const FString& MarkerPath);
+	FString BuildReplayPixelHistoryKey(int32 ResourceIndex, const FIntPoint& Pixel,
+		int32 Mip, int32 Slice, int32 Sample, int32 TypeCast);
 	FString ClassifySemantics(const FEventEvidence& Event);
 	FString CompactMarkerPath(const FString& MarkerPath);
 

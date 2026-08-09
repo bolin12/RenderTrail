@@ -112,6 +112,76 @@ namespace UE::RenderTrail::Private::EvidenceFormatting
 			static_cast<int32>(InputLayoutCount), static_cast<int32>(VertexBufferCount),
 			bIndexBuffer ? TEXT("bound") : TEXT("none"));
 
+		const TSharedPtr<FJsonObject>* Draw = nullptr;
+		if (PipelineState->TryGetObjectField(TEXT("draw"), Draw) && Draw && Draw->IsValid())
+		{
+			bool bIndexed = false;
+			bool bInstanced = false;
+			bool bIndirect = false;
+			double NumIndicesOrVertices = 0.0;
+			double NumInstances = 0.0;
+			double BaseVertex = 0.0;
+			double IndexOffset = 0.0;
+			(*Draw)->TryGetBoolField(TEXT("indexed"), bIndexed);
+			(*Draw)->TryGetBoolField(TEXT("instanced"), bInstanced);
+			(*Draw)->TryGetBoolField(TEXT("indirect"), bIndirect);
+			(*Draw)->TryGetNumberField(TEXT("numIndicesOrVertices"), NumIndicesOrVertices);
+			(*Draw)->TryGetNumberField(TEXT("numInstances"), NumInstances);
+			(*Draw)->TryGetNumberField(TEXT("baseVertex"), BaseVertex);
+			(*Draw)->TryGetNumberField(TEXT("indexOffset"), IndexOffset);
+			Report += FString::Printf(
+				TEXT("- Draw 参数：indexed=%s；instanced=%s；indirect=%s；count=%d；instances=%d；baseVertex=%d；indexOffset=%d\n"),
+				bIndexed ? TEXT("true") : TEXT("false"), bInstanced ? TEXT("true") : TEXT("false"),
+				bIndirect ? TEXT("true") : TEXT("false"), static_cast<int32>(NumIndicesOrVertices),
+				static_cast<int32>(NumInstances), static_cast<int32>(BaseVertex), static_cast<int32>(IndexOffset));
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* VertexBuffers = nullptr;
+		if (PipelineState->TryGetArrayField(TEXT("vertexBuffers"), VertexBuffers) && VertexBuffers)
+		{
+			for (const TSharedPtr<FJsonValue>& BufferValue : *VertexBuffers)
+			{
+				const TSharedPtr<FJsonObject> Buffer = BufferValue.IsValid() ? BufferValue->AsObject() : nullptr;
+				if (!Buffer.IsValid())
+				{
+					continue;
+				}
+				FString Name;
+				double ResourceIndex = INDEX_NONE;
+				double Slot = 0.0;
+				double ByteOffset = 0.0;
+				double ByteSize = 0.0;
+				double ByteStride = 0.0;
+				Buffer->TryGetStringField(TEXT("name"), Name);
+				Buffer->TryGetNumberField(TEXT("resourceIndex"), ResourceIndex);
+				Buffer->TryGetNumberField(TEXT("slot"), Slot);
+				Buffer->TryGetNumberField(TEXT("byteOffset"), ByteOffset);
+				Buffer->TryGetNumberField(TEXT("byteSize"), ByteSize);
+				Buffer->TryGetNumberField(TEXT("byteStride"), ByteStride);
+				Report += FString::Printf(TEXT("  VB%d：resource=%d name=%s offset=%llu size=%u stride=%u\n"),
+					static_cast<int32>(Slot), static_cast<int32>(ResourceIndex),
+					Name.IsEmpty() ? TEXT("<unnamed>") : *Name,
+					static_cast<unsigned long long>(ByteOffset), static_cast<uint32>(ByteSize), static_cast<uint32>(ByteStride));
+			}
+		}
+		const TSharedPtr<FJsonObject>* IndexBuffer = nullptr;
+		if (PipelineState->TryGetObjectField(TEXT("indexBuffer"), IndexBuffer) && IndexBuffer && IndexBuffer->IsValid())
+		{
+			FString Name;
+			double ResourceIndex = INDEX_NONE;
+			double ByteOffset = 0.0;
+			double ByteSize = 0.0;
+			double ByteStride = 0.0;
+			(*IndexBuffer)->TryGetStringField(TEXT("name"), Name);
+			(*IndexBuffer)->TryGetNumberField(TEXT("resourceIndex"), ResourceIndex);
+			(*IndexBuffer)->TryGetNumberField(TEXT("byteOffset"), ByteOffset);
+			(*IndexBuffer)->TryGetNumberField(TEXT("byteSize"), ByteSize);
+			(*IndexBuffer)->TryGetNumberField(TEXT("byteStride"), ByteStride);
+			Report += FString::Printf(TEXT("  IB：resource=%d name=%s offset=%llu size=%u stride=%u\n"),
+				static_cast<int32>(ResourceIndex), Name.IsEmpty() ? TEXT("<unnamed>") : *Name,
+				static_cast<unsigned long long>(ByteOffset), static_cast<uint32>(ByteSize), static_cast<uint32>(ByteStride));
+		}
+
 		const TSharedPtr<FJsonObject>* Rasterizer = nullptr;
 		if (PipelineState->TryGetObjectField(TEXT("rasterizer"), Rasterizer) && Rasterizer && Rasterizer->IsValid())
 		{
