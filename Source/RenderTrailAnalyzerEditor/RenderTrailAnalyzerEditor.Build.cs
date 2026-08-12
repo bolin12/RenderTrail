@@ -15,6 +15,7 @@ public class RenderTrailAnalyzerEditor : ModuleRules
 			"ImageWrapper",
 			"InputCore",
 			"Json",
+			"PropertyEditor",
 			"Projects",
 			"RenderTrailCore",
 			"Slate",

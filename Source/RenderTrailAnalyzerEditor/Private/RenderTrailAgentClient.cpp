@@ -58,11 +58,11 @@ namespace UE::RenderTrail::Private
 		ActiveRequest->SetTimeout(120.0f);
 		ActiveRequest->SetActivityTimeout(120.0f);
 
-		const TWeakPtr<FRenderTrailAgentClient> WeakThis = AsShared();
+		const TWeakPtr<FRenderTrailAgentClient> WeakClient = AsShared();
 		ActiveRequest->OnProcessRequestComplete().BindLambda(
-			[WeakThis, Generation](FHttpRequestPtr HttpRequest, FHttpResponsePtr HttpResponse, bool bSucceeded)
+			[WeakClient, Generation](FHttpRequestPtr HttpRequest, FHttpResponsePtr HttpResponse, bool bSucceeded)
 			{
-				if (const TSharedPtr<FRenderTrailAgentClient> Pinned = WeakThis.Pin())
+				if (const TSharedPtr<FRenderTrailAgentClient> Pinned = WeakClient.Pin())
 				{
 					Pinned->HandleComplete(HttpRequest, HttpResponse, bSucceeded, Generation);
 				}
@@ -70,9 +70,9 @@ namespace UE::RenderTrail::Private
 
 		const FHttpRequestPtr RequestToStart = ActiveRequest;
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-			[WeakThis, RequestToStart, Generation](float)
+			[WeakClient, RequestToStart, Generation](float)
 			{
-				const TSharedPtr<FRenderTrailAgentClient> Pinned = WeakThis.Pin();
+				const TSharedPtr<FRenderTrailAgentClient> Pinned = WeakClient.Pin();
 				if (!Pinned.IsValid() || Pinned->RequestGeneration != Generation || Pinned->ActiveRequest != RequestToStart)
 				{
 					return false;

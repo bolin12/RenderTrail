@@ -1,7 +1,5 @@
 #include "RenderTrailProtocol.h"
 #include "IRenderTrailAnalyzerEditorModule.h"
-#include "RenderTrailModelBrokerSettings.h"
-#include "RenderTrailModelBrokerSettingsCustomization.h"
 
 #include "Containers/Ticker.h"
 #include "Editor.h"
@@ -22,7 +20,6 @@
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
-#include "PropertyEditorModule.h"
 #include "RenderingThread.h"
 #include "RHI.h"
 #include "Styling/AppStyle.h"
@@ -258,23 +255,11 @@ class FRenderTrailCaptureEditorModule final : public IModuleInterface
 public:
 	virtual void StartupModule() override
 	{
-		FPropertyEditorModule& PropertyEditor = FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
-		PropertyEditor.RegisterCustomClassLayout(
-			URenderTrailOwnedModelSettings::StaticClass()->GetFName(),
-			FOnGetDetailCustomizationInstance::CreateStatic(&FRenderTrailModelBrokerSettingsCustomization::MakeInstance));
-		PropertyEditor.NotifyCustomizationModuleChanged();
-
 		UToolMenus::RegisterStartupCallback(FSimpleMulticastDelegate::FDelegate::CreateRaw(this, &FRenderTrailCaptureEditorModule::RegisterMenus));
 	}
 
 	virtual void ShutdownModule() override
 	{
-		if (FModuleManager::Get().IsModuleLoaded(TEXT("PropertyEditor")))
-		{
-			FPropertyEditorModule& PropertyEditor = FModuleManager::GetModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor"));
-			PropertyEditor.UnregisterCustomClassLayout(URenderTrailOwnedModelSettings::StaticClass()->GetFName());
-			PropertyEditor.NotifyCustomizationModuleChanged();
-		}
 		if (CapturePollHandle.IsValid())
 		{
 			FTSTicker::GetCoreTicker().RemoveTicker(CapturePollHandle);
